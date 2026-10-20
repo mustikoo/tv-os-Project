@@ -1,0 +1,2342 @@
+diff --git a/README.md b/README.md
+index 6d01fbc..90f9143 100644
+--- a/README.md
++++ b/README.md
+@@ -183,6 +183,7 @@ tools/theme.sh themes/aurora                                 # push a theme; --r
+ | [`tools/b64push.py`](tools/b64push.py) | Uploads large files such as APKs in base64 chunks and verifies the checksum. |
+ | [`tools/disable.sh`](tools/disable.sh), [`restore.sh`](tools/restore.sh) | Apply or undo a debloat list. |
+ | [`tools/theme.sh`](tools/theme.sh) | Push a folder from [`themes/`](themes/) to the launcher and restart Home. |
++| [`tools/banners.sh`](tools/banners.sh) | Push high resolution banners (`<package>.png`, 16:9) that replace an app's tile banner and fill the top shelf. `--reset` removes them. |
+ | [`launcher/build-and-install.sh`](launcher/build-and-install.sh) | Builds a shrunk release (about 280 KB), installs it, switches Home, and rolls back if Home does not land on it. |
+ 
+ Debloat list paths passed to `disable.sh` and `restore.sh` are relative to the directory you run
+@@ -213,6 +214,10 @@ the install script finds `~/Android/Sdk` and the `java` on your PATH.
+ - **Themes** set the same keys plus a background colour and a wallpaper from a `config.json` pushed to the TV, no rebuild. Three ship in [`themes/`](themes/), documented there.
+ - **Language** follows the TV: English, German, Spanish, Catalan, French, Russian, Serbian (Latin), Polish, Arabic, Simplified Chinese, Thai, Turkish. Android 13+ can set it for the launcher alone: `tools/tv.py 'cmd locale set-app-locales com.gathin.tvhome --locales ca'`.
+   Russian includes the module-card approval and management screens and the VPN-off badge.
++- **Edit Home on the TV**: hold OK on a tile for a menu. *Move* picks the tile up (arrow keys move it, OK puts it down; the first row is the dock). *New folder with ...* and *Add to ...* group apps into a folder tile that shows up to four of their icons; OK opens it, and holding OK on an app inside takes it out again. *Hide* removes an app from Home, *App info* opens its Settings page. On a folder tile: *Rename* and *Dissolve folder*. *Show hidden apps* and *Reset home layout* appear in the menu once there is something to undo. Saved in the launcher's private storage, so a theme push does not touch it.
++- **Category line and auto folders**: the focused dock app's category ("Games", "Video", "Music"...) appears in small capitals above its name when the app declares one. *Organize by category* in the hold-OK menu makes one folder per category from the apps below the dock (two or more apps each); the dock stays as it is.
++- **tvOS details**: an app opens by growing out of its tile; Back walks back to the first dock tile instead of doing nothing; app names sort by the TV's language (a Turkish "Çocuk" no longer lands after "Z"); switching animations off in Developer options switches reduced motion on. With navigation sounds on, OK down taps and a key that hits the edge of the grid bumps.
++- **Navigation sounds** (off by default): a soft tick as the highlight moves and a chime when an app opens, synthesised on the TV, no audio files. Switch on with `navigation_sounds` in `config.xml` or `tools/theme.sh themes/tvos-sounds`.
+ - **Module cards** let any TV app declare its own tile (label, caption, glow). The launcher asks you once per app, Keep hidden by default, and remembers the answer for that app's signing key and card name. Hold OK on Settings to change your mind. How to make one: [`docs/modules.md`](docs/modules.md); the contract: [`docs/specs/card.md`](docs/specs/card.md).
+ - **Clock screensaver**: a drifting clock over the glow, so nothing burns in. Pick "Clock" in the TV's screensaver settings, or over ADB:
+   `tools/tv.py 'settings put secure screensaver_components com.gathin.tvhome/.ClockDream; settings put secure screensaver_enabled 1'`
+diff --git a/launcher/app/build.gradle b/launcher/app/build.gradle
+index 4579341..833d445 100644
+--- a/launcher/app/build.gradle
++++ b/launcher/app/build.gradle
+@@ -10,8 +10,8 @@ android {
+         applicationId 'com.gathin.tvhome'
+         minSdk 26
+         targetSdk 34
+-        versionCode 4
+-        versionName '2.3'
++        versionCode 5
++        versionName '2.4'
+     }
+ 
+     buildTypes {
+diff --git a/launcher/app/src/main/java/com/gathin/tvhome/AppAdapter.java b/launcher/app/src/main/java/com/gathin/tvhome/AppAdapter.java
+index b795d03..8c7bf2f 100644
+--- a/launcher/app/src/main/java/com/gathin/tvhome/AppAdapter.java
++++ b/launcher/app/src/main/java/com/gathin/tvhome/AppAdapter.java
+@@ -4,16 +4,22 @@ import android.content.ActivityNotFoundException;
+ import android.content.ComponentName;
+ import android.content.Context;
+ import android.content.Intent;
++import android.app.ActivityOptions;
++import android.content.pm.ApplicationInfo;
+ import android.content.pm.PackageManager;
+ import android.content.pm.ResolveInfo;
+ import android.content.res.Resources;
+ import android.graphics.Bitmap;
+ import android.graphics.Canvas;
+ import android.graphics.Color;
++import android.graphics.Paint;
+ import android.graphics.Outline;
+ import android.graphics.Rect;
++import android.graphics.drawable.BitmapDrawable;
+ import android.graphics.drawable.Drawable;
+ import android.net.Uri;
++import android.os.Bundle;
++import android.os.SystemClock;
+ import android.provider.Settings;
+ import android.util.DisplayMetrics;
+ import android.view.KeyEvent;
+@@ -30,6 +36,8 @@ import android.widget.Toast;
+ import androidx.annotation.NonNull;
+ import androidx.recyclerview.widget.RecyclerView;
+ 
++import java.io.File;
++import java.text.Collator;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collections;
+@@ -50,10 +58,16 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
+ 
+         /** Called for a D-pad direction key on a tile. Return true when handled (focus stays put). */
+         boolean onTileVerticalKey(int position, int keyCode);
++
++        /** Long press on a tile: the home screen menu (move, hide, app info). */
++        void onTileMenu(int position, View card);
++
++        /** A folder tile was opened. */
++        void onFolderOpen(String folderId);
+     }
+ 
+     static final class Entry {
+-        static final int APP = 0, HOME_SETTINGS = 1, CARD = 2;
++        static final int APP = 0, HOME_SETTINGS = 1, CARD = 2, FOLDER = 3;
+ 
+         final int kind;
+         final String label;
+@@ -65,6 +79,12 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
+         final String name;
+         /** Ambient glow colour; 0 until sampled from the banner, or the card's accent from the start. */
+         int ambient;
++        /** The high resolution banner file this tile shows (banners/<package>.png), or null. Also the top shelf artwork. */
++        File art;
++        /** For a FOLDER tile: its id in {@link HomeLayout}. */
++        String folderId;
++        /** The app's declared category (ApplicationInfo.CATEGORY_*), or -1 when it declares none. */
++        int category = -1;
+ 
+         Entry(String label, ComponentName component, Drawable banner, Drawable icon) {
+             this(APP, label, component, banner, icon, null, 0);
+@@ -83,6 +103,15 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
+     }
+ 
+     static final float FOCUS_SCALE = 1.10f;
++    /** tvOS style press: the focused tile sinks to this fraction of its zoom while OK is held. */
++    static final float PRESS_SCALE = 0.95f;
++    /** tvOS style parallax: the tile that gains focus leans this many degrees into the move, then settles. */
++    static final float TILT_DEG = 5f;
++    private static final long TILT_WINDOW_MS = 150;
++    /** Direction (-1..1) of the last D-pad key and when it was pressed. The tile that had focus writes it,
++     *  the tile that gains focus reads it once; a stale value (a key that moved nothing) expires. */
++    private static float keyDx, keyDy;
++    private static long keyTime;
+     /** Design size of a tile (dp); tiles shrink from here when the columns don't fit, see tileWidthPx. */
+     static final float DESIGN_W_DP = 180f, DESIGN_H_DP = 101f;
+ 
+@@ -118,15 +147,23 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
+     /** Calmer motion for weak GPUs (config.xml, reduced_motion): no overshoot, shorter fades. */
+     private final boolean reducedMotion;
+     private final List<Entry> items = new ArrayList<>();
+-
+-    AppAdapter(Context ctx, TileListener listener, int dockSize, Config cfg) {
++    /** banners/ in the launcher's external files directory; null when there is none. */
++    private final File bannersDir;
++    /** What the owner changed on the TV: tile order, hidden apps (and, later, folders). */
++    private final HomeLayout layout;
++    /** The apps inside each folder tile, by folder id, as of the last reload. */
++    private final Map<String, List<Entry>> folderMembers = new HashMap<>();
++
++    AppAdapter(Context ctx, TileListener listener, int dockSize, Config cfg, HomeLayout layout) {
+         this.ctx = ctx;
++        this.layout = layout;
+         this.listener = listener;
+         this.dockSize = dockSize;
+         this.favourites = cfg.dockApps;
+         this.hidden = new HashSet<>(cfg.hiddenApps);
+         this.showHomeSettings = cfg.showHomeSettingsShortcut;
+         this.reducedMotion = cfg.reducedMotion;
++        this.bannersDir = Banners.dir(ctx);
+         // Tiles keep their identity across reload(), so a focused tile stays on its app instead of
+         // its view being rebound to whatever app now sits in that slot.
+         setHasStableIds(true);
+@@ -143,23 +180,48 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
+         Map<String, Cards.Card> cardByPkg = new HashMap<>();
+         for (Cards.Card c : cards) cardByPkg.put(c.pkg, c);
+         List<Entry> fresh = new ArrayList<>();
++        // How wide a banner has to be to stay sharp at the focus zoom: 1.5 pixels per displayed pixel.
++        DisplayMetrics dm = ctx.getResources().getDisplayMetrics();
++        int gridInner = dm.widthPixels - Math.round(112 * dm.density);   // the grid's 56dp side padding
++        int minBannerW = Math.round(tileWidthPx(gridInner, dockSize, dm.density) * FOCUS_SCALE * 1.5f);
+         for (ResolveInfo ri : found) {
+             if (ri.activityInfo == null) continue;
+             String pkg = ri.activityInfo.packageName;
+-            if (pkg.equals(ctx.getPackageName()) || hidden.contains(pkg)) continue;
++            if (pkg.equals(ctx.getPackageName()) || hidden.contains(pkg) || layout.hidden().contains(pkg)) continue;
+             ComponentName component = new ComponentName(pkg, ri.activityInfo.name);
+             Cards.Card card = cardByPkg.get(pkg);
+             if (card != null && !card.component.equals(component)) continue;   // the card stands in for this tile
+-            Drawable banner = loadBanner(pm, ri);
++            // A high resolution banner from banners/ wins over the one the app ships.
++            File art = Banners.find(bannersDir, pkg);
++            Drawable banner = null;
++            if (art != null) {
++                Bitmap big = Banners.tile(art, minBannerW);
++                if (big != null) {
++                    BitmapDrawable bd = new BitmapDrawable(ctx.getResources(), big);
++                    bd.setFilterBitmap(true);
++                    banner = bd;
++                } else {
++                    art = null;
++                }
++            }
++            if (banner == null) banner = loadBanner(pm, ri);
+             Drawable icon = ri.loadIcon(pm);
++            Entry entry;
+             if (card != null) {
+-                fresh.add(new Entry(Entry.CARD, card.label, component, banner, icon, card.caption, card.accent));
++                entry = new Entry(Entry.CARD, card.label, component, banner, icon, card.caption, card.accent);
+             } else {
+                 // Same cleaner as the card prompt: an app label with a bidi override or line separator must not
+                 // redraw the tile name as something else (#117).
+-                fresh.add(new Entry(Cards.cleanLabel(String.valueOf(ri.loadLabel(pm)), pkg), component, banner, icon));
++                entry = new Entry(Cards.cleanLabel(String.valueOf(ri.loadLabel(pm)), pkg), component, banner, icon);
+             }
++            entry.art = art;
++            entry.category = categoryOf(ri.activityInfo.applicationInfo);
++            fresh.add(entry);
+         }
++        // The TV's language decides the order of letters: with plain compareToIgnoreCase a Turkish
++        // "Çocuk" or "Şarkı" would land after "Z".
++        final Collator collator = Collator.getInstance();
++        collator.setStrength(Collator.PRIMARY);
+         Collections.sort(fresh, (a, b) -> {
+             int fa = favourites.indexOf(a.pkg), fb = favourites.indexOf(b.pkg);
+             if (fa >= 0 || fb >= 0) {
+@@ -170,7 +232,7 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
+             // Cards come right after the configured dock apps, before the alphabetical grid.
+             boolean ca = a.kind == Entry.CARD, cb = b.kind == Entry.CARD;
+             if (ca != cb) return ca ? -1 : 1;
+-            return a.label.compareToIgnoreCase(b.label);
++            return collator.compare(a.label, b.label);
+         });
+         // Optional "Default home" tile (config.xml), only when this TV actually has a home-screen picker.
+         if (showHomeSettings
+@@ -179,11 +241,124 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
+                     new ComponentName(ctx, HomeSettingsActivity.class), null,
+                     ctx.getDrawable(R.drawable.ic_home_settings), null, 0));
+         }
++        fresh = withFolders(fresh, minBannerW);
++        sortByLayout(fresh);
+         items.clear();
+         items.addAll(fresh);
+         notifyDataSetChanged();
+     }
+ 
++    /**
++     * Folders: an app the owner put in a folder leaves the grid and the folder takes one tile, showing up to four
++     * of its icons. A folder with no installed app left is not shown (the layout file keeps it).
++     */
++    private List<Entry> withFolders(List<Entry> all, int tileW) {
++        folderMembers.clear();
++        if (layout.folders().isEmpty()) return all;
++        Map<String, List<Entry>> inside = new HashMap<>();
++        List<Entry> out = new ArrayList<>();
++        for (Entry e : all) {
++            HomeLayout.Folder f = e.kind == Entry.HOME_SETTINGS ? null : layout.folderOf(e.pkg);
++            if (f == null) {
++                out.add(e);
++                continue;
++            }
++            List<Entry> list = inside.get(f.id);
++            if (list == null) inside.put(f.id, list = new ArrayList<>());
++            list.add(e);
++        }
++        for (HomeLayout.Folder f : layout.folders()) {
++            final HomeLayout.Folder folder = f;
++            List<Entry> list = inside.get(f.id);
++            if (list == null || list.isEmpty()) continue;
++            Collections.sort(list, (a, b) -> Integer.compare(folder.apps.indexOf(a.pkg), folder.apps.indexOf(b.pkg)));
++            Entry tile = new Entry(Entry.FOLDER, f.name, new ComponentName(ctx.getPackageName(), "folder." + f.id),
++                    folderBanner(list, tileW), null, null, 0);
++            tile.folderId = f.id;
++            folderMembers.put(f.id, list);
++            out.add(tile);
++        }
++        return out;
++    }
++
++    /** The key of a folder's tile (what {@link #keyAt} returns for it). */
++    static String folderKey(Context ctx, String folderId) {
++        return new ComponentName(ctx.getPackageName(), "folder." + folderId).flattenToShortString();
++    }
++
++    List<Entry> membersOf(String folderId) {
++        List<Entry> list = folderMembers.get(folderId);
++        return list == null ? new ArrayList<Entry>() : new ArrayList<>(list);
++    }
++
++    /** A tile sized picture: dark slab with up to four member icons in a 2 by 2 grid. */
++    private Drawable folderBanner(List<Entry> members, int width) {
++        int w = Math.max(160, width);
++        int h = tileHeightPx(w);
++        Bitmap bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
++        Canvas c = new Canvas(bmp);
++        Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
++        paint.setColor(0xFF2A2A2E);
++        c.drawRect(0, 0, w, h, paint);
++        int size = Math.round(h * 0.34f);
++        int gap = Math.round(h * 0.08f);
++        int left = (w - (2 * size + gap)) / 2;
++        int top = (h - (2 * size + gap)) / 2;
++        for (int i = 0; i < Math.min(4, members.size()); i++) {
++            Drawable icon = members.get(i).icon;
++            if (icon == null) continue;
++            // A private copy: changing the bounds of a drawable another view shows would blank it.
++            Drawable d = icon.getConstantState() != null ? icon.getConstantState().newDrawable().mutate() : icon;
++            Rect saved = new Rect(d.getBounds());
++            int x = left + (i % 2) * (size + gap), y = top + (i / 2) * (size + gap);
++            d.setBounds(x, y, x + size, y + size);
++            d.draw(c);
++            d.setBounds(saved);
++        }
++        BitmapDrawable out = new BitmapDrawable(ctx.getResources(), bmp);
++        out.setFilterBitmap(true);
++        return out;
++    }
++
++    /**
++     * The owner's saved order, when there is one: tiles it lists come first in that order, the rest keep
++     * the default order after them. A stable sort, so nothing else moves.
++     */
++    private void sortByLayout(List<Entry> list) {
++        List<String> order = layout.order();
++        if (order == null || order.isEmpty()) return;
++        final Map<String, Integer> rank = new HashMap<>();
++        for (int i = 0; i < order.size(); i++) rank.put(order.get(i), i);
++        Collections.sort(list, (a, b) -> {
++            Integer ra = rank.get(keyOf(a)), rb = rank.get(keyOf(b));
++            if (ra == null && rb == null) return 0;
++            if (ra == null) return 1;
++            if (rb == null) return -1;
++            return Integer.compare(ra, rb);
++        });
++    }
++
++    /** Applies a changed saved order to the tiles already built (no package queries). */
++    void reorder() {
++        sortByLayout(items);
++        notifyDataSetChanged();
++    }
++
++    private static String keyOf(Entry e) {
++        return e.component.flattenToShortString();
++    }
++
++    /** The keys of every tile in order (what the owner's saved order is made of). */
++    List<String> keys() {
++        List<String> out = new ArrayList<>(items.size());
++        for (Entry e : items) out.add(keyOf(e));
++        return out;
++    }
++
++    Entry entryAt(int position) {
++        return position >= 0 && position < items.size() ? items.get(position) : null;
++    }
++
+     private Drawable loadBanner(PackageManager pm, ResolveInfo ri) {
+         int id = ri.activityInfo.banner;
+         if (id == 0) id = ri.activityInfo.applicationInfo.banner;
+@@ -242,20 +417,28 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
+             h.label.setText(e.label);
+             h.label.setVisibility(View.VISIBLE);
+         }
+-        h.card.setOnClickListener(v -> launch(e));
++        h.card.setOnClickListener(v -> launch(e, v));
+         h.card.setOnLongClickListener(v -> {
+-            Intent i = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + e.pkg));
+-            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+-            try {
+-                ctx.startActivity(i);
+-            } catch (ActivityNotFoundException ignored) {
+-            }
++            // The key release goes to the menu, so undo the press here.
++            if (!reducedMotion && v.isFocused()) v.animate().scaleX(FOCUS_SCALE).scaleY(FOCUS_SCALE).setDuration(120).start();
++            int p = h.getBindingAdapterPosition();
++            if (listener != null && p != RecyclerView.NO_POSITION) listener.onTileMenu(p, v);
+             return true;
+         });
+     }
+ 
+     /** Opens the tile's activity by explicit component, with no extras: a card can name nothing else. */
+-    private void launch(Entry e) {
++    void launch(Entry e) {
++        launch(e, null);
++    }
++
++    /** {@code from}, when given, is the tile the app opens from: it grows out of that tile, tvOS style. */
++    void launch(Entry e, View from) {
++        NavSounds.select();
++        if (e.kind == Entry.FOLDER) {
++            if (listener != null) listener.onFolderOpen(e.folderId);
++            return;
++        }
+         if (e.kind == Entry.HOME_SETTINGS) {
+             ctx.startActivity(new Intent(ctx, HomeSettingsActivity.class)
+                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+@@ -266,7 +449,11 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
+                 .setComponent(e.component)
+                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+         try {
+-            ctx.startActivity(i);
++            Bundle opts = null;
++            if (!reducedMotion && from != null && from.getWidth() > 0) {
++                opts = ActivityOptions.makeScaleUpAnimation(from, 0, 0, from.getWidth(), from.getHeight()).toBundle();
++            }
++            ctx.startActivity(i, opts);
+         } catch (Exception ex) {
+             Toast.makeText(ctx, ctx.getString(R.string.cant_open, e.label), Toast.LENGTH_SHORT).show();
+         }
+@@ -300,6 +487,39 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
+         return position >= 0 && position < items.size() ? items.get(position).label : "";
+     }
+ 
++    /** What the app says it is, or -1: ApplicationInfo.category, or the older games flag. */
++    @SuppressWarnings("deprecation")
++    static int categoryOf(ApplicationInfo ai) {
++        if (ai == null) return -1;
++        if (ai.category != ApplicationInfo.CATEGORY_UNDEFINED) return ai.category;
++        return (ai.flags & ApplicationInfo.FLAG_IS_GAME) != 0 ? ApplicationInfo.CATEGORY_GAME : -1;
++    }
++
++    /** The string resource naming a category, or 0 for one the Home screen does not show. */
++    static int categoryName(int category) {
++        switch (category) {
++            case ApplicationInfo.CATEGORY_GAME: return R.string.category_game;
++            case ApplicationInfo.CATEGORY_VIDEO: return R.string.category_video;
++            case ApplicationInfo.CATEGORY_AUDIO: return R.string.category_audio;
++            case ApplicationInfo.CATEGORY_IMAGE: return R.string.category_image;
++            case ApplicationInfo.CATEGORY_SOCIAL: return R.string.category_social;
++            case ApplicationInfo.CATEGORY_NEWS: return R.string.category_news;
++            case ApplicationInfo.CATEGORY_MAPS: return R.string.category_maps;
++            case ApplicationInfo.CATEGORY_PRODUCTIVITY: return R.string.category_productivity;
++            default: return 0;
++        }
++    }
++
++    /** The category of the app at this position, or -1 (folders and cards of unknown apps have none). */
++    int categoryAt(int position) {
++        return position >= 0 && position < items.size() ? items.get(position).category : -1;
++    }
++
++    /** The high resolution banner file behind the tile at this position, or null. */
++    File artAt(int position) {
++        return position >= 0 && position < items.size() ? items.get(position).art : null;
++    }
++
+     /** A vivid colour sampled from the app's banner (or icon), cached per entry; a card's accent when it set one. */
+     int ambientColorAt(int position) {
+         if (position < 0 || position >= items.size()) return 0xFF444444;
+@@ -382,10 +602,32 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
+             });
+             card.setClipToOutline(true);
+ 
++            // Mild perspective, so a few degrees of tilt reads as depth and not as a skew.
++            card.setCameraDistance(8000f * density);
++
+             card.setOnKeyListener((view, keyCode, event) -> {
++                if (!reducedMotion && (keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER
++                        || keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER)) {
++                    // Press: sink while OK is held, spring back on release. The click still fires on release.
++                    float p = FOCUS_SCALE * PRESS_SCALE;
++                    if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
++                        NavSounds.press();
++                        view.animate().cancel();
++                        view.animate().scaleX(p).scaleY(p).setDuration(90)
++                                .setInterpolator(new DecelerateInterpolator()).withLayer().start();
++                    } else if (event.getAction() == KeyEvent.ACTION_UP) {
++                        view.animate().cancel();
++                        view.animate().scaleX(FOCUS_SCALE).scaleY(FOCUS_SCALE).setDuration(160)
++                                .setInterpolator(new OvershootInterpolator(1.6f)).withLayer().start();
++                    }
++                    return false;
++                }
+                 if (event.getAction() != KeyEvent.ACTION_DOWN) return false;
+                 if (keyCode != KeyEvent.KEYCODE_DPAD_UP && keyCode != KeyEvent.KEYCODE_DPAD_DOWN
+                         && keyCode != KeyEvent.KEYCODE_DPAD_LEFT && keyCode != KeyEvent.KEYCODE_DPAD_RIGHT) return false;
++                keyDx = keyCode == KeyEvent.KEYCODE_DPAD_LEFT ? -1f : keyCode == KeyEvent.KEYCODE_DPAD_RIGHT ? 1f : 0f;
++                keyDy = keyCode == KeyEvent.KEYCODE_DPAD_UP ? -1f : keyCode == KeyEvent.KEYCODE_DPAD_DOWN ? 1f : 0f;
++                keyTime = SystemClock.uptimeMillis();
+                 int pos = getBindingAdapterPosition();
+                 return listener != null && pos != RecyclerView.NO_POSITION && listener.onTileVerticalKey(pos, keyCode);
+             });
+@@ -403,8 +645,15 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
+                             .start();
+                     name.animate().alpha(focused ? 1f : 0f).setDuration(100).start();
+                 } else {
+-                    view.animate().scaleX(s).scaleY(s)
+-                            .setDuration(focused ? 260 : 180)
++                    if (focused && SystemClock.uptimeMillis() - keyTime < TILT_WINDOW_MS) {
++                        // Lean into the move, then settle with the same overshoot as the zoom. If it leans
++                        // the wrong way on your TV, flip the signs.
++                        view.setRotationY(keyDx * TILT_DEG);
++                        view.setRotationX(-keyDy * TILT_DEG);
++                        keyDx = keyDy = 0f;
++                    }
++                    view.animate().scaleX(s).scaleY(s).rotationX(0f).rotationY(0f)
++                            .setDuration(focused ? 340 : 180)
+                             .setInterpolator(new OvershootInterpolator(focused ? 1.6f : 0f))
+                             .withLayer()
+                             .start();
+diff --git a/launcher/app/src/main/java/com/gathin/tvhome/Banners.java b/launcher/app/src/main/java/com/gathin/tvhome/Banners.java
+new file mode 100644
+index 0000000..a4b959a
+--- /dev/null
++++ b/launcher/app/src/main/java/com/gathin/tvhome/Banners.java
+@@ -0,0 +1,77 @@
++package com.gathin.tvhome;
++
++import android.content.Context;
++import android.graphics.Bitmap;
++import android.graphics.BitmapFactory;
++import android.util.Log;
++import android.util.LruCache;
++
++import java.io.File;
++
++/**
++ * High resolution banners that replace an app's own (often 320x180) banner: a file named
++ * {@code <package>.png|jpg|webp} in the launcher's external files directory, {@code banners/}.
++ * Push them with tools/banners.sh. Decoding is downsampled to what the screen needs and cached, so a
++ * 4K image costs about as much memory as a 1080p one; every failure just means "no override".
++ */
++final class Banners {
++    private static final String TAG = "TvHome.Banners";
++    static final String DIR = "banners";
++    private static final String[] EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"};
++    private static final long MAX_BYTES = 6L * 1024 * 1024;
++
++    private static final LruCache<String, Bitmap> TILES = new LruCache<>(24);
++    private static final LruCache<String, Bitmap> ART = new LruCache<>(3);
++
++    private Banners() {
++    }
++
++    /** The banners folder, or null when external storage is unavailable. */
++    static File dir(Context ctx) {
++        File base = Config.dir(ctx);
++        return base == null ? null : new File(base, DIR);
++    }
++
++    /** The override file for this package, or null. Only a valid package name can name a file. */
++    static File find(File dir, String pkg) {
++        if (dir == null || !Cards.isPackageName(pkg)) return null;
++        for (String ext : EXTENSIONS) {
++            File f = new File(dir, pkg + ext);
++            if (f.isFile() && f.length() > 0 && f.length() <= MAX_BYTES) return f;
++        }
++        return null;
++    }
++
++    /** A tile sized bitmap: at least minWidth wide when the file is that wide, less than twice that. */
++    static Bitmap tile(File f, int minWidth) {
++        return decode(TILES, f, minWidth, Bitmap.Config.ARGB_8888);
++    }
++
++    /** Full screen artwork for the top shelf; half the memory (no alpha), meant for a background thread. */
++    static Bitmap art(File f, int minWidth) {
++        return decode(ART, f, minWidth, Bitmap.Config.RGB_565);
++    }
++
++    private static Bitmap decode(LruCache<String, Bitmap> cache, File f, int minWidth, Bitmap.Config config) {
++        String key = f.getPath() + '|' + f.lastModified() + '|' + f.length() + '|' + minWidth;
++        Bitmap hit = cache.get(key);
++        if (hit != null && !hit.isRecycled()) return hit;
++        try {
++            BitmapFactory.Options o = new BitmapFactory.Options();
++            o.inJustDecodeBounds = true;
++            BitmapFactory.decodeFile(f.getPath(), o);
++            if (o.outWidth <= 0 || o.outHeight <= 0) return null;
++            int sample = 1;
++            while (o.outWidth / (sample * 2) >= minWidth) sample *= 2;
++            o.inJustDecodeBounds = false;
++            o.inSampleSize = sample;
++            o.inPreferredConfig = config;
++            Bitmap b = BitmapFactory.decodeFile(f.getPath(), o);
++            if (b != null) cache.put(key, b);
++            return b;
++        } catch (Exception | OutOfMemoryError e) {
++            Log.w(TAG, f.getName() + ": " + e);
++            return null;
++        }
++    }
++}
+diff --git a/launcher/app/src/main/java/com/gathin/tvhome/Config.java b/launcher/app/src/main/java/com/gathin/tvhome/Config.java
+index ab95d96..0bb2bf7 100644
+--- a/launcher/app/src/main/java/com/gathin/tvhome/Config.java
++++ b/launcher/app/src/main/java/com/gathin/tvhome/Config.java
+@@ -3,6 +3,7 @@ package com.gathin.tvhome;
+ import android.content.Context;
+ import android.content.res.Resources;
+ import android.graphics.Color;
++import android.provider.Settings;
+ import android.util.Log;
+ 
+ import org.json.JSONArray;
+@@ -46,6 +47,10 @@ final class Config {
+     final boolean reducedMotion;
+     final String vpnApp;
+     final boolean showHomeSettingsShortcut;
++    /** Top shelf artwork from a high resolution banner (banners/), when the focused dock app has one. */
++    final boolean heroArt;
++    /** Soft tick and chime sounds on navigation (off by default). */
++    final boolean navigationSounds;
+     /** Background colour behind everything, #RRGGBB; black unless a theme says otherwise. */
+     final int backgroundColor;
+     /** Full-screen picture behind the launcher, or null for the plain colour. */
+@@ -57,7 +62,7 @@ final class Config {
+                    String sourcePanelService, String sourcePanelAction, String inputAction,
+                    int columns, int rowsBelowDock,
+                    boolean shamsiDate, boolean moduleCards, boolean reducedMotion, String vpnApp,
+-                   boolean showHomeSettingsShortcut, int backgroundColor,
++                   boolean showHomeSettingsShortcut, boolean heroArt, boolean navigationSounds, int backgroundColor,
+                    File wallpaper, boolean overlayApplied) {
+         this.dockApps = Collections.unmodifiableList(dockApps);
+         this.hiddenApps = Collections.unmodifiableList(hiddenApps);
+@@ -73,6 +78,8 @@ final class Config {
+         this.reducedMotion = reducedMotion;
+         this.vpnApp = vpnApp;
+         this.showHomeSettingsShortcut = showHomeSettingsShortcut;
++        this.heroArt = heroArt;
++        this.navigationSounds = navigationSounds;
+         this.backgroundColor = backgroundColor;
+         this.wallpaper = wallpaper;
+         this.overlayApplied = overlayApplied;
+@@ -99,6 +106,8 @@ final class Config {
+         boolean reducedMotion = res.getBoolean(R.bool.reduced_motion);
+         String vpn = res.getString(R.string.vpn_app).trim();
+         boolean homeSettings = res.getBoolean(R.bool.show_home_settings_shortcut);
++        boolean heroArt = res.getBoolean(R.bool.hero_art);
++        boolean sounds = res.getBoolean(R.bool.navigation_sounds);
+         int background = 0xFF000000;
+         boolean applied = false;
+ 
+@@ -121,8 +130,17 @@ final class Config {
+             reducedMotion = bool(json, "reduced_motion", reducedMotion);
+             vpn = string(json, "vpn_app", vpn);
+             homeSettings = bool(json, "show_home_settings_shortcut", homeSettings);
++            heroArt = bool(json, "hero_art", heroArt);
++            sounds = bool(json, "navigation_sounds", sounds);
+             background = color(json, "background_color", background);
+         }
++        // Animations switched off system wide (Developer options, animator duration scale 0): calm motion too.
++        try {
++            if (Settings.Global.getFloat(ctx.getContentResolver(), Settings.Global.ANIMATOR_DURATION_SCALE, 1f) == 0f) {
++                reducedMotion = true;
++            }
++        } catch (Exception ignored) {
++        }
+         File wallpaper = dir != null ? new File(dir, WALLPAPER_NAME) : null;
+         if (wallpaper != null && !(wallpaper.isFile() && wallpaper.length() > 0)) wallpaper = null;
+         // A theme can also switch the wallpaper off while the file is still there.
+@@ -130,7 +148,7 @@ final class Config {
+ 
+         return new Config(dock, hidden, liveTv, liveTvAction, panelService, panelAction, inputAction,
+                 Math.max(1, columns), Math.max(0, rowsBelow), shamsi, moduleCards, reducedMotion,
+-                vpn, homeSettings, background, wallpaper, applied);
++                vpn, homeSettings, heroArt, sounds, background, wallpaper, applied);
+     }
+ 
+     /** Reads and parses the overlay; any problem means "no overlay", never a crash on the home screen. */
+diff --git a/launcher/app/src/main/java/com/gathin/tvhome/HomeLayout.java b/launcher/app/src/main/java/com/gathin/tvhome/HomeLayout.java
+new file mode 100644
+index 0000000..c56a759
+--- /dev/null
++++ b/launcher/app/src/main/java/com/gathin/tvhome/HomeLayout.java
+@@ -0,0 +1,328 @@
++package com.gathin.tvhome;
++
++import android.content.Context;
++import android.util.AtomicFile;
++import android.util.Log;
++
++import java.io.File;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Set;
++
++/**
++ * What the owner changed on the TV itself: the order of the tiles, the apps hidden from Home and the
++ * folders. Kept in {@code layout.txt} in the launcher's private storage, one line per fact:
++ *
++ * <pre>
++ * tvhome-layout 1
++ * order com.netflix.ninja/.MainActivity
++ * hidden com.example.junk
++ * folder f1k2 Streaming
++ * member f1k2 com.example.player
++ * </pre>
++ *
++ * No JSON and no regular expressions, like {@link Cards}: plain character checks, so the parser can be
++ * unit tested on the JVM and a damaged file means "no changes", never a crash on the home screen.
++ * An absent order means the default one (dock apps from config, cards, then alphabetical).
++ */
++final class HomeLayout {
++
++    static final String FILE = "layout.txt";
++    private static final String HEADER = "tvhome-layout 1";
++    private static final String TAG = "TvHome.Layout";
++    static final int MAX_CHARS = 64 * 1024;
++    static final int MAX_ORDER = 400;
++    static final int MAX_HIDDEN = 200;
++    static final int MAX_FOLDERS = 16;
++    static final int MAX_MEMBERS = 24;
++    static final int NAME_MAX = 24;
++
++    /** A named group of apps shown as one tile. */
++    static final class Folder {
++        final String id;
++        String name;
++        final List<String> apps = new ArrayList<>();
++
++        Folder(String id, String name) {
++            this.id = id;
++            this.name = name;
++        }
++    }
++
++    /** Null in tests: nothing is written. */
++    private final File file;
++    private List<String> order;
++    private final Set<String> hidden = new LinkedHashSet<>();
++    private final List<Folder> folders = new ArrayList<>();
++
++    HomeLayout(File file) {
++        this.file = file;
++    }
++
++    // ---- reading ---------------------------------------------------------------------------------
++
++    /** The saved layout, or an empty one when there is none or it does not read. */
++    static HomeLayout load(Context ctx) {
++        File f = new File(ctx.getFilesDir(), FILE);
++        if (!f.isFile()) return new HomeLayout(f);
++        try {
++            String text = new String(new AtomicFile(f).readFully(), StandardCharsets.UTF_8);
++            HomeLayout parsed = parse(text, f);
++            if (parsed != null) return parsed;
++            Log.w(TAG, FILE + " does not read; starting from the default layout");
++        } catch (IOException e) {
++            Log.w(TAG, "cannot read " + FILE + ": " + e);
++        }
++        return new HomeLayout(f);
++    }
++
++    /** The layout in this text, or null when the header is wrong or the text is too big. Bad lines are skipped. */
++    static HomeLayout parse(String text, File file) {
++        if (text == null || text.length() > MAX_CHARS) return null;
++        HomeLayout out = new HomeLayout(file);
++        boolean header = false;
++        int start = 0;
++        for (int i = 0; i <= text.length(); i++) {
++            if (i < text.length() && text.charAt(i) != '\n') continue;
++            String line = text.substring(start, i);
++            start = i + 1;
++            if (line.endsWith("\r")) line = line.substring(0, line.length() - 1);
++            if (line.isEmpty()) continue;
++            if (!header) {
++                if (!line.equals(HEADER)) return null;
++                header = true;
++                continue;
++            }
++            int sp = line.indexOf(' ');
++            if (sp <= 0 || sp == line.length() - 1) continue;
++            String kind = line.substring(0, sp);
++            String rest = line.substring(sp + 1);
++            switch (kind) {
++                case "order":
++                    if (isKey(rest) && out.orderSize() < MAX_ORDER) out.addOrder(rest);
++                    break;
++                case "hidden":
++                    if (Cards.isPackageName(rest) && out.hidden.size() < MAX_HIDDEN) out.hidden.add(rest);
++                    break;
++                case "folder": {
++                    int sp2 = rest.indexOf(' ');
++                    if (sp2 <= 0 || out.folders.size() >= MAX_FOLDERS) break;
++                    String id = rest.substring(0, sp2);
++                    String name = rest.substring(sp2 + 1);
++                    if (isId(id) && out.folder(id) == null && isName(name)) {
++                        out.folders.add(new Folder(id, name));
++                    }
++                    break;
++                }
++                case "member": {
++                    int sp2 = rest.indexOf(' ');
++                    if (sp2 <= 0) break;
++                    Folder f = out.folder(rest.substring(0, sp2));
++                    String pkg = rest.substring(sp2 + 1);
++                    if (f != null && Cards.isPackageName(pkg) && f.apps.size() < MAX_MEMBERS
++                            && out.folderOf(pkg) == null && !out.hidden.contains(pkg)) {
++                        f.apps.add(pkg);
++                    }
++                    break;
++                }
++                default:
++                    break;
++            }
++        }
++        if (!header) return null;
++        out.dropEmptyFolders();
++        return out;
++    }
++
++    private int orderSize() {
++        return order == null ? 0 : order.size();
++    }
++
++    private void addOrder(String key) {
++        if (order == null) order = new ArrayList<>();
++        if (!order.contains(key)) order.add(key);
++    }
++
++    /** A tile key: a component ("pkg/.Activity", "pkg/com.x.Y$Z") or a folder ("pkg/folder.id"). */
++    static boolean isKey(String s) {
++        if (s == null || s.isEmpty() || s.length() > 200) return false;
++        for (int i = 0; i < s.length(); i++) {
++            char c = s.charAt(i);
++            boolean ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
++                    || c == '.' || c == '_' || c == '/' || c == '$' || c == '-';
++            if (!ok) return false;
++        }
++        return true;
++    }
++
++    /** A folder name exactly as {@link #cleanName} writes it. */
++    static boolean isName(String s) {
++        return s != null && !s.isEmpty() && s.length() <= NAME_MAX && cleanName(s).equals(s);
++    }
++
++    static boolean isId(String s) {
++        if (s == null || s.isEmpty() || s.length() > 12) return false;
++        for (int i = 0; i < s.length(); i++) {
++            char c = s.charAt(i);
++            if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))) return false;
++        }
++        return true;
++    }
++
++    // ---- queries ---------------------------------------------------------------------------------
++
++    /** The saved tile order (component keys), or null for the default order. A copy. */
++    List<String> order() {
++        return order == null ? null : new ArrayList<>(order);
++    }
++
++    Set<String> hidden() {
++        return Collections.unmodifiableSet(hidden);
++    }
++
++    List<Folder> folders() {
++        return Collections.unmodifiableList(folders);
++    }
++
++    Folder folder(String id) {
++        for (Folder f : folders) if (f.id.equals(id)) return f;
++        return null;
++    }
++
++    Folder folderOf(String pkg) {
++        for (Folder f : folders) if (f.apps.contains(pkg)) return f;
++        return null;
++    }
++
++    /** True when nothing was changed: the default order, nothing hidden, no folders. */
++    boolean isDefault() {
++        return order == null && hidden.isEmpty() && folders.isEmpty();
++    }
++
++    // ---- changes (each one is saved at once) -----------------------------------------------------
++
++    void setOrder(List<String> keys) {
++        List<String> next = new ArrayList<>();
++        for (String k : keys) {
++            if (isKey(k) && !next.contains(k) && next.size() < MAX_ORDER) next.add(k);
++        }
++        order = next;
++        persist();
++    }
++
++    void hide(String pkg) {
++        if (!Cards.isPackageName(pkg) || hidden.size() >= MAX_HIDDEN) return;
++        removeFromFolder(pkg);
++        hidden.add(pkg);
++        persist();
++    }
++
++    void unhideAll() {
++        hidden.clear();
++        persist();
++    }
++
++    /** A new folder holding one app, or null at the limit. The app must not be hidden. */
++    Folder newFolder(String name, String firstPkg) {
++        if (folders.size() >= MAX_FOLDERS || !Cards.isPackageName(firstPkg)) return null;
++        String id;
++        int n = 0;
++        do {
++            id = "f" + Long.toString(System.currentTimeMillis() + n++, 36);
++            if (id.length() > 12) id = id.substring(0, 12);
++        } while (folder(id) != null);
++        Folder f = new Folder(id, cleanName(name));
++        removeFromFolder(firstPkg);
++        f.apps.add(firstPkg);
++        folders.add(f);
++        persist();
++        return f;
++    }
++
++    /** Puts the app in the folder (and out of any other). False when the folder is full. */
++    boolean addToFolder(Folder f, String pkg) {
++        if (f == null || !Cards.isPackageName(pkg) || f.apps.size() >= MAX_MEMBERS) return false;
++        removeFromFolder(pkg);
++        f.apps.add(pkg);
++        persist();
++        return true;
++    }
++
++    /** Takes the app out of its folder; a folder left empty goes away. */
++    void takeOut(String pkg) {
++        removeFromFolder(pkg);
++        persist();
++    }
++
++    /** Opens the folder: its apps go back to the grid. */
++    void dissolve(Folder f) {
++        folders.remove(f);
++        persist();
++    }
++
++    void rename(Folder f, String name) {
++        f.name = cleanName(name);
++        persist();
++    }
++
++    /** Back to the default layout; the file is deleted. */
++    void reset() {
++        order = null;
++        hidden.clear();
++        folders.clear();
++        if (file != null && file.exists() && !file.delete()) Log.w(TAG, "cannot delete " + FILE);
++    }
++
++    private void removeFromFolder(String pkg) {
++        Folder f = folderOf(pkg);
++        if (f == null) return;
++        f.apps.remove(pkg);
++        dropEmptyFolders();
++    }
++
++    private void dropEmptyFolders() {
++        for (int i = folders.size() - 1; i >= 0; i--) if (folders.get(i).apps.isEmpty()) folders.remove(i);
++    }
++
++    /** A folder name as the Home screen shows it: the same cleaner as app labels, at most {@link #NAME_MAX} characters. */
++    static String cleanName(String name) {
++        String s = Cards.cleanLabel(name, "Folder");
++        return s.length() > NAME_MAX ? s.substring(0, NAME_MAX).trim() : s;
++    }
++
++    // ---- writing ---------------------------------------------------------------------------------
++
++    String encode() {
++        StringBuilder b = new StringBuilder(HEADER).append('\n');
++        if (order != null) for (String k : order) b.append("order ").append(k).append('\n');
++        for (String p : hidden) b.append("hidden ").append(p).append('\n');
++        for (Folder f : folders) {
++            b.append("folder ").append(f.id).append(' ').append(f.name).append('\n');
++            for (String p : f.apps) b.append("member ").append(f.id).append(' ').append(p).append('\n');
++        }
++        return b.toString();
++    }
++
++    private void persist() {
++        if (file == null) return;
++        if (isDefault()) {
++            if (file.exists() && !file.delete()) Log.w(TAG, "cannot delete " + FILE);
++            return;
++        }
++        AtomicFile af = new AtomicFile(file);
++        FileOutputStream out = null;
++        try {
++            out = af.startWrite();
++            out.write(encode().getBytes(StandardCharsets.UTF_8));
++            af.finishWrite(out);
++        } catch (IOException e) {
++            Log.w(TAG, "cannot write " + FILE + ": " + e);
++            if (out != null) af.failWrite(out);
++        }
++    }
++}
+diff --git a/launcher/app/src/main/java/com/gathin/tvhome/MainActivity.java b/launcher/app/src/main/java/com/gathin/tvhome/MainActivity.java
+index 4990185..4b8f945 100644
+--- a/launcher/app/src/main/java/com/gathin/tvhome/MainActivity.java
++++ b/launcher/app/src/main/java/com/gathin/tvhome/MainActivity.java
+@@ -1,5 +1,7 @@
+ package com.gathin.tvhome;
+ 
++import android.animation.ObjectAnimator;
++import android.animation.PropertyValuesHolder;
+ import android.app.Activity;
+ import android.app.Dialog;
+ import android.content.ActivityNotFoundException;
+@@ -37,13 +39,16 @@ import android.text.SpannableString;
+ import android.text.Spanned;
+ import android.text.TextPaint;
+ import android.text.TextUtils;
++import android.util.TypedValue;
+ import android.view.Gravity;
+ import android.view.KeyEvent;
+ import android.view.View;
+ import android.view.ViewGroup;
+ import android.view.Window;
+ import android.view.animation.AnimationUtils;
++import android.view.animation.DecelerateInterpolator;
+ import android.view.animation.LayoutAnimationController;
++import android.widget.EditText;
+ import android.widget.FrameLayout;
+ import android.widget.ImageView;
+ import android.widget.LinearLayout;
+@@ -60,6 +65,8 @@ import androidx.recyclerview.widget.GridLayoutManager;
+ import androidx.recyclerview.widget.RecyclerView;
+ 
+ import java.io.File;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
+ import java.util.ArrayList;
+ import java.util.Calendar;
+ import java.util.Collections;
+@@ -88,6 +95,13 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+     private GlassView glass;
+     private View ambient;
+     private TextView heroName;
++    private TextView heroCategory;
++    // Top shelf artwork (config hero_art): a high resolution banner decoded off the main thread.
++    private View heroArtGroup;
++    private ImageView heroArt;
++    private boolean heroArtEnabled;
++    private File heroArtFile;
++    private ExecutorService heroArtExec;
+     private int ambientColor = -1;
+     private boolean heroShown;
+     private TextView greeting;
+@@ -114,6 +128,14 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+     private boolean reducedMotion;
+     /** hidden_apps as the adapter sees them (config.xml or a theme's config.json): a hidden app gets no card either. */
+     private Set<String> hiddenApps = Collections.emptySet();
++    /** hidden_apps from config alone; the owner's own hidden apps (layout) are added to it on every reload. */
++    private Set<String> configHidden = Collections.emptySet();
++    /** The owner's changes made on the TV: tile order, hidden apps. */
++    private HomeLayout layout;
++    /** The key of the tile being moved (long press, Move), or null. Arrow keys move it, OK or Back ends it. */
++    private String moveKey;
++    private ObjectAnimator movePulse;
++    private Dialog renameDialog;
+     private List<Cards.Card> cards = Collections.emptyList();
+     /** The grid has been laid out and focused since the last resume; the card prompt waits for this. */
+     private boolean tilesReady;
+@@ -188,6 +210,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+         Config cfg = Config.load(this);
+         COLUMNS = cfg.columns;
+         reducedMotion = cfg.reducedMotion;
++        NavSounds.init(cfg.navigationSounds);
+         liveTvPkg = cfg.liveTvPackage;
+         liveTvAction = cfg.liveTvAction;
+         inputAction = cfg.inputAction;
+@@ -200,6 +223,10 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+         glass = findViewById(R.id.glass);
+         ambient = findViewById(R.id.ambient);
+         heroName = findViewById(R.id.heroName);
++        heroCategory = findViewById(R.id.heroCategory);
++        heroArtGroup = findViewById(R.id.heroArtGroup);
++        heroArt = findViewById(R.id.heroArt);
++        heroArtEnabled = cfg.heroArt && !cfg.reducedMotion;   // a full screen fade is what reduced motion avoids
+         greeting = findViewById(R.id.greeting);
+         btnWifi = findViewById(R.id.btnWifi);
+         shamsiDate = findViewById(R.id.shamsiDate);
+@@ -212,7 +239,9 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+         }
+         vpnApp = cfg.vpnApp;
+         moduleCards = cfg.moduleCards;
+-        hiddenApps = new HashSet<>(cfg.hiddenApps);
++        configHidden = new HashSet<>(cfg.hiddenApps);
++        hiddenApps = configHidden;
++        layout = HomeLayout.load(this);
+ 
+         grid = findViewById(R.id.grid);
+         grid.setLayoutManager(new GridLayoutManager(this, COLUMNS));
+@@ -223,7 +252,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+         float enterDelay = reducedMotion ? 0f : 0.06f;
+         grid.setLayoutAnimation(new LayoutAnimationController(
+                 AnimationUtils.loadAnimation(this, enterAnim), enterDelay));
+-        adapter = new AppAdapter(this, this, COLUMNS, cfg);
++        adapter = new AppAdapter(this, this, COLUMNS, cfg, layout);
+         grid.setAdapter(adapter);
+ 
+         // tvOS layout: push the dock row towards the bottom of the screen, leaving room for
+@@ -404,7 +433,9 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+             glass.setAlpha(0f);
+             heroShown = false;
+             heroName.setAlpha(0f);
++            heroCategory.setAlpha(0f);
+             ambient.setAlpha(0f);
++            hideHeroArt();
+         }
+         reloadTiles();
+         if (animate && !reducedMotion) grid.scheduleLayoutAnimation();
+@@ -434,6 +465,9 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+         final String returnKey = lastFocusedKey;
+         final int returnSlot = lastFocused;
+         final List<Cards.Card> none = Collections.emptyList();
++        Set<String> allHidden = new HashSet<>(configHidden);
++        allHidden.addAll(layout.hidden());
++        hiddenApps = allHidden;
+         cards = moduleCards ? CardFeature.run(() -> Cards.discover(this, hiddenApps, Cards.load(Cards.storeFile(this))), none) : none;
+         adapter.reload(cards.isEmpty() ? none : CardFeature.run(() -> Cards.shown(cards), none));
+         lastFocusedKey = returnKey;
+@@ -463,6 +497,8 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+         // Nothing of ours stays on screen over another app; an undecided prompt simply returns next time.
+         if (cardPrompt != null) cardPrompt.dismiss();
+         if (openPopup != null) openPopup.dismiss();
++        if (renameDialog != null) renameDialog.dismiss();
++        endMove();
+     }
+ 
+     @Override
+@@ -476,6 +512,8 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+         super.onDestroy();
+         ConnectivityManager cm = getSystemService(ConnectivityManager.class);
+         TvInputManager tim = (TvInputManager) getSystemService(TV_INPUT_SERVICE);
++        if (heroArtExec != null) heroArtExec.shutdownNow();
++        NavSounds.release();
+         if (tim != null) tim.unregisterCallback(inputCallback);
+         if (cm != null) {
+             cm.unregisterNetworkCallback(networkCallback);
+@@ -485,7 +523,11 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+ 
+     @Override
+     public void onBackPressed() {
+-        // Home screen: Back goes nowhere.
++        // Home screen: Back never leaves Home. From anywhere but the first dock tile it walks back to it
++        // (from the grid, from the top bar), like Back on tvOS; on the first tile it does nothing.
++        View f = getCurrentFocus();
++        boolean onFirst = f != null && f.getId() == R.id.card && lastFocused == 0;
++        if (!onFirst && adapter.getItemCount() > 0) focusTile(0);
+     }
+ 
+     // ---- glass highlight -------------------------------------------------------------------------
+@@ -512,6 +554,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+         }
+         glassTargetX = x;
+         glassTargetY = y;
++        if (glassShown) NavSounds.tick();   // the highlight moved from another tile
+         if (!glassShown) {
+             springX.cancel();
+             springY.cancel();
+@@ -547,9 +590,11 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+     // ---- top shelf -------------------------------------------------------------------------------
+ 
+     private void showHero(int position, float dockTopInRoot) {
++        showHeroArt(adapter.artAt(position));
+         String label = adapter.labelAt(position);
+         int color = adapter.ambientColorAt(position);
+         float y = dockTopInRoot - 14 * density - 26 * density - heroName.getHeight();
++        showHeroCategory(adapter.categoryAt(position), y);
+         boolean changed = !label.contentEquals(heroName.getText());
+ 
+         if (reducedMotion) {
+@@ -595,6 +640,59 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+         }
+     }
+ 
++    /** The small category line above the app's name; nothing for an app that declares none. */
++    private void showHeroCategory(int category, float nameY) {
++        int res = AppAdapter.categoryName(category);
++        if (res == 0) {
++            heroCategory.animate().alpha(0f).setDuration(120).start();
++            return;
++        }
++        heroCategory.animate().cancel();
++        heroCategory.setText(res);
++        heroCategory.setY(nameY - heroCategory.getHeight() - 4 * density);
++        heroCategory.setAlpha(reducedMotion ? 1f : heroCategory.getAlpha());
++        if (!reducedMotion) heroCategory.animate().alpha(1f).setDuration(260).start();
++    }
++
++    /** Fades the focused dock app's high resolution banner in behind the dock; null (no banner) fades it out. */
++    private void showHeroArt(File file) {
++        if (!heroArtEnabled) return;
++        if (file == null) {
++            hideHeroArt();
++            return;
++        }
++        if (file.equals(heroArtFile)) return;   // already showing, or still decoding, this one
++        heroArtFile = file;
++        if (heroArtExec == null) heroArtExec = Executors.newSingleThreadExecutor();
++        final File want = file;
++        final int width = getResources().getDisplayMetrics().widthPixels;
++        try {
++            heroArtExec.execute(() -> {
++                final Bitmap bmp = Banners.art(want, width);
++                handler.post(() -> {
++                    if (!want.equals(heroArtFile)) return;   // focus moved on while decoding
++                    if (bmp == null) {
++                        hideHeroArt();
++                        return;
++                    }
++                    heroArtGroup.animate().cancel();
++                    heroArtGroup.animate().alpha(0f).setDuration(120).withEndAction(() -> {
++                        heroArt.setImageBitmap(bmp);
++                        heroArtGroup.animate().alpha(1f).setDuration(450).start();
++                    }).start();
++                });
++            });
++        } catch (RuntimeException ignored) {   // executor shut down: the activity is going away
++        }
++    }
++
++    private void hideHeroArt() {
++        if (heroArtFile == null && heroArtGroup.getAlpha() == 0f) return;
++        heroArtFile = null;
++        heroArtGroup.animate().cancel();
++        heroArtGroup.animate().alpha(0f).setDuration(200).start();
++    }
++
+     /**
+      * The glow used to be a full-screen radial GradientDrawable. On Android 10 that drawable is
+      * drawn on the CPU, so fading it for half a second redrew 1920×1080 every frame and the
+@@ -623,6 +721,8 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+ 
+     private void hideHero() {
+         if (!heroShown) return;
++        hideHeroArt();
++        heroCategory.animate().alpha(0f).setDuration(reducedMotion ? 100 : 160).start();
+         heroShown = false;
+         heroName.animate().alpha(0f).setDuration(reducedMotion ? 100 : 160).start();
+         ambient.animate().alpha(0f).setDuration(reducedMotion ? 140 : 300).start();
+@@ -643,17 +743,24 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+         // Horizontal: swallow the key at a row's ends so focus never wraps to the next row or
+         // escapes up into the top bar. Mid-row moves fall through to the default focus search.
+         if (keyCode == KeyEvent.KEYCODE_DPAD_LEFT) {
+-            return position % COLUMNS == 0;
++            boolean edge = position % COLUMNS == 0;
++            if (edge) NavSounds.bump();
++            return edge;
+         }
+         if (keyCode == KeyEvent.KEYCODE_DPAD_RIGHT) {
+-            return position % COLUMNS == COLUMNS - 1 || position == count - 1;
++            boolean edge = position % COLUMNS == COLUMNS - 1 || position == count - 1;
++            if (edge) NavSounds.bump();
++            return edge;
+         }
+         if (keyCode == KeyEvent.KEYCODE_DPAD_UP) {
+             if (position < COLUMNS) return false;          // dock row: let focus move to the top bar
+             target = position - COLUMNS;
+         } else {
+             int lastRowStart = ((count - 1) / COLUMNS) * COLUMNS;
+-            if (position >= lastRowStart) return true;     // already on the last row: stay put
++            if (position >= lastRowStart) {                // already on the last row: stay put
++                NavSounds.bump();
++                return true;
++            }
+             target = Math.min(position + COLUMNS, count - 1);
+         }
+         focusTile(target);
+@@ -989,6 +1096,299 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+         rows.addView(row);
+     }
+ 
++    // ---- editing the home screen -----------------------------------------------------------------
++
++    /**
++     * Hold OK on a tile: move it, put it in a folder, hide it, open its app info; on a folder tile: move,
++     * rename, dissolve. Everything is kept in {@link HomeLayout}.
++     */
++    @Override
++    public void onTileMenu(int position, View card) {
++        if (moveKey != null) return;
++        final AppAdapter.Entry e = adapter.entryAt(position);
++        if (e == null) return;
++        final String key = adapter.keyAt(position);
++
++        View panel = getLayoutInflater().inflate(R.layout.popup_inputs, root, false);
++        LinearLayout rows = panel.findViewById(R.id.rows);
++        final PopupWindow popup = glassPopup(panel, (int) (250 * density));
++        rows.addView(menuHeader(e.label));
++        addInputRow(rows, popup, R.drawable.ic_move, getString(R.string.menu_move), -1, () -> startMove(key));
++        if (e.kind == AppAdapter.Entry.FOLDER) {
++            final HomeLayout.Folder folder = layout.folder(e.folderId);
++            if (folder != null) {
++                addInputRow(rows, popup, R.drawable.ic_folder, getString(R.string.menu_rename), -1,
++                        () -> showRename(folder, () -> finishFolderChange(folder.id)));
++                addInputRow(rows, popup, R.drawable.ic_hide, getString(R.string.menu_dissolve), -1, () -> {
++                    layout.dissolve(folder);
++                    reloadTiles();
++                    restoreFocus();
++                });
++            }
++        } else if (e.kind != AppAdapter.Entry.HOME_SETTINGS) {
++            addInputRow(rows, popup, R.drawable.ic_folder, getString(R.string.menu_new_folder, e.label), -1, () -> {
++                HomeLayout.Folder f = layout.newFolder(getString(R.string.folder_default_name), e.pkg);
++                if (f == null) {
++                    Toast.makeText(this, R.string.folder_limit, Toast.LENGTH_SHORT).show();
++                    return;
++                }
++                final String id = f.id;
++                showRename(f, () -> finishFolderChange(id));   // the name is asked right away; OK keeps "Folder"
++            });
++            int listed = 0;
++            for (final HomeLayout.Folder f : layout.folders()) {
++                if (listed++ >= 4) break;
++                addInputRow(rows, popup, R.drawable.ic_folder, getString(R.string.menu_add_to_folder, f.name), -1, () -> {
++                    if (!layout.addToFolder(f, e.pkg)) {
++                        Toast.makeText(this, R.string.folder_limit, Toast.LENGTH_SHORT).show();
++                        return;
++                    }
++                    finishFolderChange(f.id);
++                });
++            }
++            addInputRow(rows, popup, R.drawable.ic_hide, getString(R.string.menu_hide), -1, () -> {
++                layout.hide(e.pkg);
++                reloadTiles();
++                restoreFocus();
++            });
++            if (organizeGroups().size() > 0) {
++                addInputRow(rows, popup, R.drawable.ic_folder, getString(R.string.menu_organize), -1, this::organizeByCategory);
++            }
++            addInputRow(rows, popup, R.drawable.ic_info, getString(R.string.menu_app_info), -1,
++                    () -> open(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + e.pkg))));
++        }
++        boolean footer = false;
++        if (!layout.hidden().isEmpty()) {
++            addSeparator(rows);
++            footer = true;
++            addInputRow(rows, popup, R.drawable.ic_show, getString(R.string.menu_show_hidden, layout.hidden().size()), -1, () -> {
++                layout.unhideAll();
++                reloadTiles();
++                restoreFocus();
++            });
++        }
++        if (!layout.isDefault()) {
++            if (!footer) addSeparator(rows);
++            addInputRow(rows, popup, R.drawable.ic_reset, getString(R.string.menu_reset), -1, () -> {
++                layout.reset();
++                reloadTiles();
++                restoreFocus();
++            });
++        }
++        panel.measure(View.MeasureSpec.UNSPECIFIED, View.MeasureSpec.UNSPECIFIED);
++        popup.setWidth(Math.max((int) (250 * density), panel.getMeasuredWidth()));
++        popIn(popup, panel);
++        rows.getChildAt(1).requestFocus();   // child 0 is the title
++    }
++
++    /**
++     * The apps below the dock that declare the same category, for every category with at least two of them
++     * and not already in a folder. The dock apps stay where they are.
++     */
++    private java.util.Map<Integer, List<String>> organizeGroups() {
++        java.util.Map<Integer, List<String>> groups = new java.util.TreeMap<>();
++        for (int i = COLUMNS; i < adapter.getItemCount(); i++) {
++            AppAdapter.Entry en = adapter.entryAt(i);
++            if (en == null || en.kind != AppAdapter.Entry.APP || AppAdapter.categoryName(en.category) == 0) continue;
++            if (layout.folderOf(en.pkg) != null) continue;
++            List<String> list = groups.get(en.category);
++            if (list == null) groups.put(en.category, list = new ArrayList<>());
++            if (!list.contains(en.pkg)) list.add(en.pkg);
++        }
++        java.util.Iterator<java.util.Map.Entry<Integer, List<String>>> it = groups.entrySet().iterator();
++        while (it.hasNext()) if (it.next().getValue().size() < 2) it.remove();
++        return groups;
++    }
++
++    /** One folder per category (Games, Video, Music...), named in the TV's language. */
++    private void organizeByCategory() {
++        for (java.util.Map.Entry<Integer, List<String>> g : organizeGroups().entrySet()) {
++            List<String> pkgs = g.getValue();
++            HomeLayout.Folder f = layout.newFolder(getString(AppAdapter.categoryName(g.getKey())), pkgs.get(0));
++            if (f == null) break;   // the folder limit
++            for (int i = 1; i < pkgs.size(); i++) layout.addToFolder(f, pkgs.get(i));
++        }
++        reloadTiles();
++        restoreFocus();
++    }
++
++    /** After a folder was made, renamed or added to: rebuild the tiles and focus the folder's tile. */
++    private void finishFolderChange(String folderId) {
++        reloadTiles();
++        lastFocusedKey = AppAdapter.folderKey(this, folderId);
++        restoreFocus();
++    }
++
++    /** An opened folder: its apps as a list in the middle of the screen. OK opens one, hold OK takes it out. */
++    @Override
++    public void onFolderOpen(String folderId) {
++        final HomeLayout.Folder folder = layout.folder(folderId);
++        final List<AppAdapter.Entry> members = adapter.membersOf(folderId);
++        if (folder == null || members.isEmpty()) return;
++        View panel = getLayoutInflater().inflate(R.layout.popup_inputs, root, false);
++        LinearLayout rows = panel.findViewById(R.id.rows);
++        final PopupWindow popup = glassPopup(panel, (int) (280 * density));
++        rows.addView(menuHeader(folder.name));
++        for (final AppAdapter.Entry m : members) {
++            View row = getLayoutInflater().inflate(R.layout.item_folder_app, rows, false);
++            ((ImageView) row.findViewById(R.id.icon)).setImageDrawable(m.icon);
++            ((TextView) row.findViewById(R.id.title)).setText(m.label);
++            row.setOnClickListener(v -> {
++                popup.dismiss();
++                adapter.launch(m);
++            });
++            row.setOnLongClickListener(v -> {
++                popup.dismiss();
++                layout.takeOut(m.pkg);
++                reloadTiles();
++                restoreFocus();
++                return true;
++            });
++            rows.addView(row);
++        }
++        TextView hint = (TextView) menuHeader(getString(R.string.folder_hint));
++        hint.setAllCaps(false);
++        hint.setLetterSpacing(0.02f);
++        hint.setTextColor(0x73FFFFFF);
++        rows.addView(hint);
++        panel.measure(View.MeasureSpec.UNSPECIFIED, View.MeasureSpec.UNSPECIFIED);
++        popup.setWidth(Math.max((int) (280 * density), panel.getMeasuredWidth()));
++        popIn(popup, panel);
++        rows.getChildAt(1).requestFocus();
++    }
++
++    /** The folder name prompt: a glass panel with the name, Cancel and OK. {@code done} runs when it closes. */
++    private void showRename(final HomeLayout.Folder folder, final Runnable done) {
++        View panel = getLayoutInflater().inflate(R.layout.dialog_rename, root, false);
++        final EditText input = panel.findViewById(R.id.name);
++        input.setText(folder.name);
++        input.setSelection(input.getText().length());
++        View cancel = panel.findViewById(R.id.btnCancel);
++        View ok = panel.findViewById(R.id.btnOk);
++        final Dialog dialog = new Dialog(this);
++        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
++        dialog.setContentView(panel);
++        dialog.setCanceledOnTouchOutside(false);
++        Window w = dialog.getWindow();
++        if (w != null) {
++            w.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
++            w.setLayout((int) (440 * density), ViewGroup.LayoutParams.WRAP_CONTENT);
++            w.setDimAmount(0.6f);
++        }
++        final boolean[] closed = {false};
++        final Runnable finish = () -> {
++            if (closed[0]) return;
++            closed[0] = true;
++            renameDialog = null;
++            dialog.dismiss();
++            done.run();
++        };
++        ok.setOnClickListener(v -> {
++            layout.rename(folder, input.getText().toString());
++            finish.run();
++        });
++        cancel.setOnClickListener(v -> finish.run());
++        dialog.setOnCancelListener(d -> finish.run());
++        renameDialog = dialog;
++        dialog.show();
++        ok.requestFocus();
++    }
++
++    private View menuHeader(String title) {
++        TextView h = new TextView(this);
++        h.setText(title);
++        h.setSingleLine(true);
++        h.setEllipsize(TextUtils.TruncateAt.END);
++        h.setTextColor(0x8CFFFFFF);
++        h.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
++        h.setAllCaps(true);
++        h.setLetterSpacing(0.18f);
++        h.setTypeface(getResources().getFont(R.font.outfit));
++        h.setPadding((int) (12 * density), (int) (8 * density), (int) (12 * density), (int) (6 * density));
++        return h;
++    }
++
++    /** Fade and grow in the middle of the screen. */
++    private void popIn(PopupWindow popup, View panel) {
++        panel.setAlpha(0f);
++        panel.setScaleX(0.94f);
++        panel.setScaleY(0.94f);
++        popup.showAtLocation(root, Gravity.CENTER, 0, 0);
++        panel.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(200)
++                .setInterpolator(new DecelerateInterpolator(1.6f)).start();
++    }
++
++    /** Move mode: the arrow keys swap the tile with its neighbour, OK or Back keeps it where it is. */
++    private void startMove(String key) {
++        moveKey = key;
++        Toast.makeText(this, R.string.move_hint, Toast.LENGTH_LONG).show();
++        if (!reducedMotion) {
++            movePulse = ObjectAnimator.ofPropertyValuesHolder(glass,
++                    PropertyValuesHolder.ofFloat(View.SCALE_X, 1f, 1.07f),
++                    PropertyValuesHolder.ofFloat(View.SCALE_Y, 1f, 1.07f));
++            movePulse.setDuration(480);
++            movePulse.setRepeatCount(ObjectAnimator.INFINITE);
++            movePulse.setRepeatMode(ObjectAnimator.REVERSE);
++            movePulse.start();
++        }
++    }
++
++    private void endMove() {
++        if (moveKey == null) return;
++        moveKey = null;
++        if (movePulse != null) {
++            movePulse.cancel();
++            movePulse = null;
++        }
++        glass.setScaleX(1f);
++        glass.setScaleY(1f);
++    }
++
++    private void moveSelected(int dx, int dy) {
++        List<String> keys = adapter.keys();
++        int i = keys.indexOf(moveKey);
++        if (i < 0) return;
++        // Rows do not wrap: Left from the first column or Right from the last stays put.
++        if ((dx < 0 && i % COLUMNS == 0) || (dx > 0 && i % COLUMNS == COLUMNS - 1)) return;
++        int j = i + dx + dy * COLUMNS;
++        if (j < 0 || j >= keys.size()) return;
++        Collections.swap(keys, i, j);
++        layout.setOrder(keys);
++        adapter.reorder();
++        lastFocusedKey = moveKey;
++        restoreFocus();
++    }
++
++    @Override
++    public boolean dispatchKeyEvent(KeyEvent event) {
++        if (moveKey != null) {
++            boolean down = event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0;
++            switch (event.getKeyCode()) {
++                case KeyEvent.KEYCODE_DPAD_LEFT:
++                    if (down) moveSelected(-1, 0);
++                    return true;
++                case KeyEvent.KEYCODE_DPAD_RIGHT:
++                    if (down) moveSelected(1, 0);
++                    return true;
++                case KeyEvent.KEYCODE_DPAD_UP:
++                    if (down) moveSelected(0, -1);
++                    return true;
++                case KeyEvent.KEYCODE_DPAD_DOWN:
++                    if (down) moveSelected(0, 1);
++                    return true;
++                case KeyEvent.KEYCODE_DPAD_CENTER:
++                case KeyEvent.KEYCODE_ENTER:
++                case KeyEvent.KEYCODE_NUMPAD_ENTER:
++                case KeyEvent.KEYCODE_BACK:
++                    if (event.getAction() == KeyEvent.ACTION_UP) endMove();
++                    return true;
++                default:
++                    break;
++            }
++        }
++        return super.dispatchKeyEvent(event);
++    }
++
+     // ---- module cards ----------------------------------------------------------------------------
+ 
+     /**
+diff --git a/launcher/app/src/main/java/com/gathin/tvhome/NavSounds.java b/launcher/app/src/main/java/com/gathin/tvhome/NavSounds.java
+new file mode 100644
+index 0000000..0cd8e65
+--- /dev/null
++++ b/launcher/app/src/main/java/com/gathin/tvhome/NavSounds.java
+@@ -0,0 +1,152 @@
++package com.gathin.tvhome;
++
++import android.media.AudioAttributes;
++import android.media.AudioFormat;
++import android.media.AudioTrack;
++import android.util.Log;
++
++/**
++ * Soft tvOS style navigation sounds: a short tick when the highlight moves, a two note chime when an app
++ * opens. Nothing is stored or downloaded: two tiny buffers are synthesised once at start (a few KB) and
++ * replayed from memory. Off unless config {@code navigation_sounds} is true. Every failure just means silence.
++ */
++final class NavSounds {
++    private static final String TAG = "TvHome.Sounds";
++    private static final int RATE = 22050;
++
++    private static AudioTrack tick, select, press, bump;
++    private static boolean on;
++
++    private NavSounds() {
++    }
++
++    static void init(boolean enabled) {
++        release();
++        if (!enabled) return;
++        try {
++            tick = build(burst(1900, 26, 0.30f));
++            select = build(chime());
++            press = build(pressTone());
++            bump = build(bumpSweep());
++            on = tick != null && select != null && press != null && bump != null;
++        } catch (Exception | LinkageError e) {
++            Log.w(TAG, "sounds off: " + e);
++            release();
++        }
++    }
++
++    static void release() {
++        on = false;
++        for (AudioTrack t : new AudioTrack[]{tick, select, press, bump}) {
++            if (t != null) {
++                try {
++                    t.release();
++                } catch (Exception ignored) {
++                }
++            }
++        }
++        tick = null;
++        select = null;
++        press = null;
++        bump = null;
++    }
++
++    /** The highlight moved. */
++    static void tick() {
++        play(tick);
++    }
++
++    /** OK went down on a tile: a lower, rounder tap. */
++    static void press() {
++        play(press);
++    }
++
++    /** A key hit the edge of the grid and went nowhere: a short falling blip. */
++    static void bump() {
++        play(bump);
++    }
++
++    /** An app was opened. */
++    static void select() {
++        play(select);
++    }
++
++    private static void play(AudioTrack t) {
++        if (!on || t == null) return;
++        try {
++            if (t.getPlayState() != AudioTrack.PLAYSTATE_STOPPED) t.stop();
++            t.reloadStaticData();
++            t.play();
++        } catch (Exception ignored) {
++        }
++    }
++
++    private static AudioTrack build(short[] pcm) {
++        AudioTrack t = new AudioTrack.Builder()
++                .setAudioAttributes(new AudioAttributes.Builder()
++                        .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
++                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
++                        .build())
++                .setAudioFormat(new AudioFormat.Builder()
++                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
++                        .setSampleRate(RATE)
++                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
++                        .build())
++                .setBufferSizeInBytes(pcm.length * 2)
++                .setTransferMode(AudioTrack.MODE_STATIC)
++                .build();
++        if (t.write(pcm, 0, pcm.length) != pcm.length) {
++            t.release();
++            return null;
++        }
++        return t;
++    }
++
++    /** A sine burst with a 2 ms attack and an exponential fade: a soft click, no pop. */
++    private static short[] burst(double hz, int ms, float amp) {
++        short[] out = new short[RATE * ms / 1000];
++        mix(out, 0, hz, amp, 5.0);
++        return out;
++    }
++
++    /** Two overlapping notes, a fifth apart, about 170 ms in all. */
++    private static short[] chime() {
++        short[] out = new short[RATE * 170 / 1000];
++        mix(out, 0, 988, 0.22f, 4.0);
++        mix(out, RATE * 55 / 1000, 1319, 0.24f, 4.0);
++        return out;
++    }
++
++    private static short[] pressTone() {
++        short[] out = new short[RATE * 80 / 1000];
++        mix(out, 0, 784, 0.26f, 5.0);
++        mix(out, 0, 392, 0.12f, 5.0);
++        return out;
++    }
++
++    /** A sine that falls from 700 to 320 Hz over 110 ms. */
++    private static short[] bumpSweep() {
++        short[] out = new short[RATE * 110 / 1000];
++        double phase = 0;
++        for (int i = 0; i < out.length; i++) {
++            double t = (double) i / out.length;
++            double hz = 700 - 380 * t;
++            phase += 2 * Math.PI * hz / RATE;
++            double env = Math.min(1.0, i / (RATE * 0.004)) * Math.exp(-5.0 * t);
++            out[i] = (short) (0.22 * env * Math.sin(phase) * Short.MAX_VALUE);
++        }
++        return out;
++    }
++
++    /** Adds a faded sine starting at sample {@code from} and running to the end of the buffer. */
++    private static void mix(short[] buf, int from, double hz, float amp, double decay) {
++        int n = buf.length - from;
++        int attack = Math.max(1, RATE * 2 / 1000);
++        for (int i = 0; i < n; i++) {
++            double env = Math.min(1.0, (double) i / attack) * Math.exp(-decay * i / n);
++            double v = amp * env * Math.sin(2 * Math.PI * hz * i / RATE);
++            int sum = buf[from + i] + (int) (v * Short.MAX_VALUE);
++            buf[from + i] = (short) Math.max(Short.MIN_VALUE, Math.min(Short.MAX_VALUE, sum));
++        }
++    }
++}
+diff --git a/launcher/app/src/main/res/drawable/hero_scrim.xml b/launcher/app/src/main/res/drawable/hero_scrim.xml
+new file mode 100644
+index 0000000..f259c88
+--- /dev/null
++++ b/launcher/app/src/main/res/drawable/hero_scrim.xml
+@@ -0,0 +1,10 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- Over the top shelf artwork: dark at the bottom (the dock), clear in the middle, dim at the top (the clock). -->
++<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
++    <gradient
++        android:angle="90"
++        android:startColor="#FF000000"
++        android:centerColor="#33000000"
++        android:endColor="#A6000000"
++        android:centerY="0.5" />
++</shape>
+diff --git a/launcher/app/src/main/res/drawable/ic_folder.xml b/launcher/app/src/main/res/drawable/ic_folder.xml
+new file mode 100644
+index 0000000..68bee65
+--- /dev/null
++++ b/launcher/app/src/main/res/drawable/ic_folder.xml
+@@ -0,0 +1,7 @@
++<?xml version="1.0" encoding="utf-8"?>
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="22dp" android:height="22dp"
++    android:viewportWidth="24" android:viewportHeight="24">
++    <path android:fillColor="#FFFFFFFF"
++        android:pathData="M10,4H4c-1.1,0 -1.99,0.9 -1.99,2L2,18c0,1.1 0.9,2 2,2h16c1.1,0 2,-0.9 2,-2V8c0,-1.1 -0.9,-2 -2,-2h-8l-2,-2z" />
++</vector>
+diff --git a/launcher/app/src/main/res/drawable/ic_hide.xml b/launcher/app/src/main/res/drawable/ic_hide.xml
+new file mode 100644
+index 0000000..973824b
+--- /dev/null
++++ b/launcher/app/src/main/res/drawable/ic_hide.xml
+@@ -0,0 +1,7 @@
++<?xml version="1.0" encoding="utf-8"?>
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="22dp" android:height="22dp"
++    android:viewportWidth="24" android:viewportHeight="24">
++    <path android:fillColor="#FFFFFFFF"
++        android:pathData="M19,6.41L17.59,5 12,10.59 6.41,5 5,6.41 10.59,12 5,17.59 6.41,19 12,13.41 17.59,19 19,17.59 13.41,12z" />
++</vector>
+diff --git a/launcher/app/src/main/res/drawable/ic_info.xml b/launcher/app/src/main/res/drawable/ic_info.xml
+new file mode 100644
+index 0000000..b907c0d
+--- /dev/null
++++ b/launcher/app/src/main/res/drawable/ic_info.xml
+@@ -0,0 +1,7 @@
++<?xml version="1.0" encoding="utf-8"?>
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="22dp" android:height="22dp"
++    android:viewportWidth="24" android:viewportHeight="24">
++    <path android:fillColor="#FFFFFFFF"
++        android:pathData="M12,2C6.48,2 2,6.48 2,12s4.48,10 10,10 10,-4.48 10,-10S17.52,2 12,2zM13,17h-2v-6h2v6zM13,9h-2V7h2v2z" />
++</vector>
+diff --git a/launcher/app/src/main/res/drawable/ic_move.xml b/launcher/app/src/main/res/drawable/ic_move.xml
+new file mode 100644
+index 0000000..8000959
+--- /dev/null
++++ b/launcher/app/src/main/res/drawable/ic_move.xml
+@@ -0,0 +1,7 @@
++<?xml version="1.0" encoding="utf-8"?>
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="22dp" android:height="22dp"
++    android:viewportWidth="24" android:viewportHeight="24">
++    <path android:fillColor="#FFFFFFFF"
++        android:pathData="M10,9h4V6h3l-5,-5 -5,5h3v3zM9,10v4H6v3l-5,-5 5,-5v3h3zM23,12l-5,-5v3h-3v4h3v3l5,-5zM14,15h-4v3H7l5,5 5,-5h-3v-3z" />
++</vector>
+diff --git a/launcher/app/src/main/res/drawable/ic_reset.xml b/launcher/app/src/main/res/drawable/ic_reset.xml
+new file mode 100644
+index 0000000..3dd7a2a
+--- /dev/null
++++ b/launcher/app/src/main/res/drawable/ic_reset.xml
+@@ -0,0 +1,7 @@
++<?xml version="1.0" encoding="utf-8"?>
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="22dp" android:height="22dp"
++    android:viewportWidth="24" android:viewportHeight="24">
++    <path android:fillColor="#FFFFFFFF"
++        android:pathData="M17.65,6.35C16.2,4.9 14.21,4 12,4c-4.42,0 -7.99,3.58 -7.99,8s3.57,8 7.99,8c3.73,0 6.84,-2.55 7.73,-6h-2.08c-0.82,2.33 -3.04,4 -5.65,4 -3.31,0 -6,-2.69 -6,-6s2.69,-6 6,-6c1.66,0 3.14,0.69 4.22,1.78L13,11h7V4l-2.35,2.35z" />
++</vector>
+diff --git a/launcher/app/src/main/res/drawable/ic_show.xml b/launcher/app/src/main/res/drawable/ic_show.xml
+new file mode 100644
+index 0000000..9eb66d6
+--- /dev/null
++++ b/launcher/app/src/main/res/drawable/ic_show.xml
+@@ -0,0 +1,7 @@
++<?xml version="1.0" encoding="utf-8"?>
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="22dp" android:height="22dp"
++    android:viewportWidth="24" android:viewportHeight="24">
++    <path android:fillColor="#FFFFFFFF"
++        android:pathData="M12,4.5C7,4.5 2.73,7.61 1,12c1.73,4.39 6,7.5 11,7.5s9.27,-3.11 11,-7.5c-1.73,-4.39 -6,-7.5 -11,-7.5zM12,17c-2.76,0 -5,-2.24 -5,-5s2.24,-5 5,-5 5,2.24 5,5 -2.24,5 -5,5zM12,9c-1.66,0 -3,1.34 -3,3s1.34,3 3,3 3,-1.34 3,-3 -1.34,-3 -3,-3z" />
++</vector>
+diff --git a/launcher/app/src/main/res/layout/activity_main.xml b/launcher/app/src/main/res/layout/activity_main.xml
+index 91346ac..2e6144f 100644
+--- a/launcher/app/src/main/res/layout/activity_main.xml
++++ b/launcher/app/src/main/res/layout/activity_main.xml
+@@ -5,6 +5,28 @@
+     android:layout_height="match_parent"
+     android:background="#FF000000">
+ 
++    <!-- Top shelf artwork (hero_art): a high resolution banner from banners/, faded under a scrim. -->
++    <FrameLayout
++        android:id="@+id/heroArtGroup"
++        android:layout_width="match_parent"
++        android:layout_height="match_parent"
++        android:alpha="0"
++        android:importantForAccessibility="no">
++
++        <ImageView
++            android:id="@+id/heroArt"
++            android:layout_width="match_parent"
++            android:layout_height="match_parent"
++            android:scaleType="centerCrop"
++            android:alpha="0.6"
++            android:contentDescription="@null" />
++
++        <View
++            android:layout_width="match_parent"
++            android:layout_height="match_parent"
++            android:background="@drawable/hero_scrim" />
++    </FrameLayout>
++
+     <!-- Ambient glow in the colour of the focused dock app. -->
+     <View
+         android:id="@+id/ambient"
+@@ -12,6 +34,22 @@
+         android:layout_height="match_parent"
+         android:alpha="0" />
+ 
++    <!-- Top shelf: the app's category ("Games", "Video") in small capitals above its name, positioned in code. -->
++    <TextView
++        android:id="@+id/heroCategory"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:layout_marginStart="70dp"
++        android:alpha="0"
++        android:textColor="#A6FFFFFF"
++        android:textSize="12sp"
++        android:fontFamily="@font/outfit"
++        android:fontVariationSettings="'wght' 500"
++        android:letterSpacing="0.2"
++        android:includeFontPadding="false"
++        android:singleLine="true"
++        android:textAllCaps="true" />
++
+     <!-- Top shelf: the focused dock app's name, positioned above the dock in code. -->
+     <TextView
+         android:id="@+id/heroName"
+diff --git a/launcher/app/src/main/res/layout/dialog_rename.xml b/launcher/app/src/main/res/layout/dialog_rename.xml
+new file mode 100644
+index 0000000..9d41c3d
+--- /dev/null
++++ b/launcher/app/src/main/res/layout/dialog_rename.xml
+@@ -0,0 +1,58 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- Folder name: a glass panel like the module card prompt. OK is focused first, so the keyboard
++     only opens when the owner moves up to the name and presses OK. -->
++<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    android:layout_width="match_parent"
++    android:layout_height="wrap_content"
++    android:orientation="vertical"
++    android:background="@drawable/glass_panel"
++    android:paddingStart="26dp"
++    android:paddingEnd="26dp"
++    android:paddingTop="22dp"
++    android:paddingBottom="20dp"
++    android:elevation="12dp">
++
++    <TextView
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:text="@string/rename_title"
++        android:textColor="#FFFFFFFF"
++        android:textSize="22sp"
++        android:fontFamily="@font/outfit"
++        android:fontVariationSettings="'wght' 500"
++        android:letterSpacing="-0.01" />
++
++    <EditText
++        android:id="@+id/name"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:layout_marginTop="14dp"
++        android:singleLine="true"
++        android:maxLength="24"
++        android:inputType="textCapWords"
++        android:imeOptions="actionDone"
++        android:textColor="#FFFFFFFF"
++        android:textSize="18sp"
++        android:backgroundTint="#99FFFFFF"
++        android:fontFamily="@font/outfit" />
++
++    <LinearLayout
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:layout_marginTop="18dp"
++        android:orientation="horizontal"
++        android:gravity="end">
++
++        <TextView
++            android:id="@+id/btnCancel"
++            style="@style/TopButton"
++            android:text="@string/rename_cancel"
++            android:nextFocusRight="@+id/btnOk" />
++
++        <TextView
++            android:id="@+id/btnOk"
++            style="@style/TopButton"
++            android:text="@string/rename_ok"
++            android:nextFocusLeft="@+id/btnCancel" />
++    </LinearLayout>
++</LinearLayout>
+diff --git a/launcher/app/src/main/res/layout/item_folder_app.xml b/launcher/app/src/main/res/layout/item_folder_app.xml
+new file mode 100644
+index 0000000..de399db
+--- /dev/null
++++ b/launcher/app/src/main/res/layout/item_folder_app.xml
+@@ -0,0 +1,34 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- One app inside an open folder: its own icon (not tinted) and its name. -->
++<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    android:layout_width="match_parent"
++    android:layout_height="46dp"
++    android:orientation="horizontal"
++    android:gravity="center_vertical"
++    android:paddingStart="12dp"
++    android:paddingEnd="12dp"
++    android:background="@drawable/input_row_bg"
++    android:focusable="true"
++    android:clickable="true">
++
++    <ImageView
++        android:id="@+id/icon"
++        android:layout_width="30dp"
++        android:layout_height="30dp"
++        android:scaleType="fitCenter"
++        android:contentDescription="@null" />
++
++    <TextView
++        android:id="@+id/title"
++        android:layout_width="0dp"
++        android:layout_height="wrap_content"
++        android:layout_weight="1"
++        android:layout_marginStart="12dp"
++        android:textColor="@drawable/pill_text"
++        android:duplicateParentState="true"
++        android:textSize="15sp"
++        android:fontFamily="@font/outfit"
++        android:fontVariationSettings="'wght' 500"
++        android:singleLine="true"
++        android:ellipsize="end" />
++</LinearLayout>
+diff --git a/launcher/app/src/main/res/values-tr/strings.xml b/launcher/app/src/main/res/values-tr/strings.xml
+index 3438c5b..6411ff3 100644
+--- a/launcher/app/src/main/res/values-tr/strings.xml
++++ b/launcher/app/src/main/res/values-tr/strings.xml
+@@ -46,4 +46,29 @@
+     <string name="card_state_new">Yeni</string>
+     <string name="card_state_new_key">Yeni anahtar</string>
+     <string name="card_state_new_label">Yeni ad</string>
++    <string name="menu_move">Taşı</string>
++    <string name="menu_hide">Gizle</string>
++    <string name="menu_app_info">Uygulama bilgisi</string>
++    <string name="menu_show_hidden">Gizli uygulamaları göster (%1$d)</string>
++    <string name="menu_reset">Ana ekranı sıfırla</string>
++    <string name="move_hint">Yön tuşlarıyla taşıyın, bitince OK tuşuna basın.</string>
++    <string name="menu_new_folder">%1$s ile yeni klasör</string>
++    <string name="menu_add_to_folder">%1$s klasörüne ekle</string>
++    <string name="menu_rename">Yeniden adlandır</string>
++    <string name="menu_dissolve">Klasörü dağıt</string>
++    <string name="folder_default_name">Klasör</string>
++    <string name="folder_hint">Çıkarmak için uygulamada OK tuşunu basılı tutun</string>
++    <string name="folder_limit">Daha fazla eklenemez</string>
++    <string name="rename_title">Klasör adı</string>
++    <string name="rename_ok">Tamam</string>
++    <string name="rename_cancel">İptal</string>
++    <string name="category_game">Oyunlar</string>
++    <string name="category_video">Video</string>
++    <string name="category_audio">Müzik</string>
++    <string name="category_image">Fotoğraflar</string>
++    <string name="category_social">Sosyal</string>
++    <string name="category_news">Haberler</string>
++    <string name="category_maps">Haritalar</string>
++    <string name="category_productivity">Verimlilik</string>
++    <string name="menu_organize">Kategoriye göre düzenle</string>
+ </resources>
+diff --git a/launcher/app/src/main/res/values/config.xml b/launcher/app/src/main/res/values/config.xml
+index c0dc918..851a2c4 100644
+--- a/launcher/app/src/main/res/values/config.xml
++++ b/launcher/app/src/main/res/values/config.xml
+@@ -69,6 +69,15 @@
+          label, caption and glow colour, once you answer Show on the prompt. false: never look for cards or ask. -->
+     <bool name="module_cards">true</bool>
+ 
++    <!-- Top shelf artwork: when the focused dock app has a high resolution banner in banners/ (tools/banners.sh), it
++         fills the screen behind the dock, faded. Needs no setting to stay off: without banners nothing changes.
++         Ignored with reduced_motion. -->
++    <bool name="hero_art">true</bool>
++
++    <!-- Navigation sounds: a soft tick when the highlight moves and a chime when an app opens, synthesised on the
++         TV (nothing is stored or downloaded). Off by default. -->
++    <bool name="navigation_sounds">false</bool>
++
+     <!-- Reduced motion: for TVs whose GPU cannot keep up (MediaTek MT5895 on Android 10 is the known case).
+          true keeps the GPU drawing path but calms the movement: a stiff highlight spring with no bounce,
+          tiles that zoom without overshoot, shorter fades and no tile entrance when Home comes back. Set it
+diff --git a/launcher/app/src/main/res/values/strings.xml b/launcher/app/src/main/res/values/strings.xml
+index aa64118..bf14e8b 100644
+--- a/launcher/app/src/main/res/values/strings.xml
++++ b/launcher/app/src/main/res/values/strings.xml
+@@ -46,4 +46,29 @@
+     <string name="card_state_new">New</string>
+     <string name="card_state_new_key">New key</string>
+     <string name="card_state_new_label">New name</string>
++    <string name="menu_move">Move</string>
++    <string name="menu_hide">Hide</string>
++    <string name="menu_app_info">App info</string>
++    <string name="menu_show_hidden">Show hidden apps (%1$d)</string>
++    <string name="menu_reset">Reset home layout</string>
++    <string name="move_hint">Arrow keys move the tile. Press OK when done.</string>
++    <string name="menu_new_folder">New folder with %1$s</string>
++    <string name="menu_add_to_folder">Add to %1$s</string>
++    <string name="menu_rename">Rename</string>
++    <string name="menu_dissolve">Dissolve folder</string>
++    <string name="folder_default_name">Folder</string>
++    <string name="folder_hint">Hold OK on an app to take it out</string>
++    <string name="folder_limit">Can\'t add more</string>
++    <string name="rename_title">Folder name</string>
++    <string name="rename_ok">OK</string>
++    <string name="rename_cancel">Cancel</string>
++    <string name="category_game">Games</string>
++    <string name="category_video">Video</string>
++    <string name="category_audio">Music</string>
++    <string name="category_image">Photos</string>
++    <string name="category_social">Social</string>
++    <string name="category_news">News</string>
++    <string name="category_maps">Maps</string>
++    <string name="category_productivity">Productivity</string>
++    <string name="menu_organize">Organize by category</string>
+ </resources>
+diff --git a/launcher/app/src/test/java/com/gathin/tvhome/HomeLayoutTest.java b/launcher/app/src/test/java/com/gathin/tvhome/HomeLayoutTest.java
+new file mode 100644
+index 0000000..121ca49
+--- /dev/null
++++ b/launcher/app/src/test/java/com/gathin/tvhome/HomeLayoutTest.java
+@@ -0,0 +1,162 @@
++package com.gathin.tvhome;
++
++import org.junit.Test;
++
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertTrue;
++
++/** Plain JVM tests for the home layout file: parsing, the folder rules and the round trip. */
++public class HomeLayoutTest {
++
++    private static HomeLayout fresh() {
++        return new HomeLayout(null);   // no file: nothing is written
++    }
++
++    @Test
++    public void emptyLayoutIsDefault() {
++        HomeLayout l = fresh();
++        assertTrue(l.isDefault());
++        assertNull(l.order());
++        assertEquals("tvhome-layout 1\n", l.encode());
++    }
++
++    @Test
++    public void roundTrip() {
++        HomeLayout l = fresh();
++        l.setOrder(Arrays.asList("com.a/.Main", "com.b/.Main", "com.gathin.tvhome/folder.x"));
++        l.hide("com.junk.app");
++        HomeLayout.Folder f = l.newFolder("Streaming  ", "com.c.player");
++        assertNotNull(f);
++        assertTrue(l.addToFolder(f, "com.d.player"));
++        HomeLayout back = HomeLayout.parse(l.encode(), null);
++        assertNotNull(back);
++        assertEquals(l.order(), back.order());
++        assertTrue(back.hidden().contains("com.junk.app"));
++        assertEquals(1, back.folders().size());
++        assertEquals("Streaming", back.folders().get(0).name);
++        assertEquals(Arrays.asList("com.c.player", "com.d.player"), back.folders().get(0).apps);
++        assertEquals(l.encode(), back.encode());
++    }
++
++    @Test
++    public void wrongHeaderAndOversizeAreRejected() {
++        assertNull(HomeLayout.parse("", null));
++        assertNull(HomeLayout.parse("order com.a/.Main\n", null));
++        assertNull(HomeLayout.parse("tvhome-layout 2\n", null));
++        assertNull(HomeLayout.parse(null, null));
++        char[] big = new char[HomeLayout.MAX_CHARS + 1];
++        Arrays.fill(big, ' ');
++        assertNull(HomeLayout.parse(new String(big), null));
++    }
++
++    @Test
++    public void badLinesAreSkippedNotFatal() {
++        String text = "tvhome-layout 1\n"
++                + "order com.a/.Main\n"
++                + "order bad key\n"                       // a space is not allowed in a key
++                + "order com.b/.Main\n"
++                + "hidden example\n"                      // not a package name
++                + "hidden com.ok.app\n"
++                + "mystery line\n"
++                + "folder F1 Upper\n"                     // ids are lower case
++                + "folder f1 Games\n"
++                + "member f1 com.g.one\n"
++                + "member f1 com.g.one\n"                 // twice
++                + "member nope com.g.two\n"               // no such folder
++                + "member f1 not-a-package\n";
++        HomeLayout l = HomeLayout.parse(text, null);
++        assertNotNull(l);
++        assertEquals(Arrays.asList("com.a/.Main", "com.b/.Main"), l.order());
++        assertEquals(1, l.hidden().size());
++        assertEquals(1, l.folders().size());
++        assertEquals(Arrays.asList("com.g.one"), l.folders().get(0).apps);
++    }
++
++    @Test
++    public void anAppLivesInOneFolderOnly() {
++        HomeLayout l = fresh();
++        HomeLayout.Folder a = l.newFolder("A", "com.x.app");
++        HomeLayout.Folder b = l.newFolder("B", "com.y.app");
++        assertTrue(l.addToFolder(b, "com.x.app"));       // moves it from A to B; A is empty and goes away
++        assertNull(l.folder(a.id));
++        assertEquals(b, l.folderOf("com.x.app"));
++        assertEquals(2, b.apps.size());
++    }
++
++    @Test
++    public void takeOutAndDissolve() {
++        HomeLayout l = fresh();
++        HomeLayout.Folder f = l.newFolder("Games", "com.g.one");
++        l.addToFolder(f, "com.g.two");
++        l.takeOut("com.g.one");
++        assertNull(l.folderOf("com.g.one"));
++        assertEquals(1, f.apps.size());
++        l.takeOut("com.g.two");                           // last one out: the folder goes
++        assertTrue(l.folders().isEmpty());
++        HomeLayout.Folder g = l.newFolder("Again", "com.g.three");
++        l.dissolve(g);
++        assertTrue(l.folders().isEmpty());
++        assertTrue(l.isDefault());
++    }
++
++    @Test
++    public void hidingTakesAnAppOutOfItsFolder() {
++        HomeLayout l = fresh();
++        l.newFolder("Games", "com.g.one");
++        l.hide("com.g.one");
++        assertTrue(l.folders().isEmpty());
++        assertTrue(l.hidden().contains("com.g.one"));
++        l.unhideAll();
++        assertTrue(l.hidden().isEmpty());
++    }
++
++    @Test
++    public void limitsHold() {
++        HomeLayout l = fresh();
++        HomeLayout.Folder f = l.newFolder("Many", "com.m.app0");
++        for (int i = 1; i < HomeLayout.MAX_MEMBERS + 5; i++) l.addToFolder(f, "com.m.app" + i);
++        assertEquals(HomeLayout.MAX_MEMBERS, f.apps.size());
++        List<String> keys = new ArrayList<>();
++        for (int i = 0; i < HomeLayout.MAX_ORDER + 20; i++) keys.add("com.k.app" + i + "/.Main");
++        l.setOrder(keys);
++        assertEquals(HomeLayout.MAX_ORDER, l.order().size());
++    }
++
++    @Test
++    public void folderNamesAreCleanedAndBounded() {
++        assertEquals("Folder", HomeLayout.cleanName(null));
++        assertEquals("Folder", HomeLayout.cleanName("\u202E\n"));
++        assertEquals("A B", HomeLayout.cleanName("A\n\nB"));
++        assertEquals(HomeLayout.NAME_MAX, HomeLayout.cleanName("0123456789012345678901234567890123456789").length());
++        assertTrue(HomeLayout.isName("Streaming"));
++        assertFalse(HomeLayout.isName(" Streaming"));
++    }
++
++    @Test
++    public void resetIsDefaultAgain() {
++        HomeLayout l = fresh();
++        l.setOrder(Arrays.asList("com.a/.Main"));
++        l.hide("com.b.app");
++        assertFalse(l.isDefault());
++        l.reset();
++        assertTrue(l.isDefault());
++    }
++
++    @Test
++    public void keyAndIdCharacters() {
++        assertTrue(HomeLayout.isKey("com.a/.Main"));
++        assertTrue(HomeLayout.isKey("com.a/com.a.Main$Inner"));
++        assertFalse(HomeLayout.isKey("com.a/ Main"));
++        assertFalse(HomeLayout.isKey(""));
++        assertTrue(HomeLayout.isId("f1k2"));
++        assertFalse(HomeLayout.isId("F1"));
++        assertFalse(HomeLayout.isId("1234567890123"));
++    }
++}
+diff --git a/themes/README.md b/themes/README.md
+index 02634cc..776a487 100644
+--- a/themes/README.md
++++ b/themes/README.md
+@@ -14,6 +14,7 @@ powershell -ExecutionPolicy Bypass -File tools\theme.ps1 -TvHost 192.168.1.50 th
+ |---|---|
+ | `default/` | The built-in look written out as JSON, as a starting point for your own |
+ | `aurora/` | A dark aurora wallpaper (teal and violet on navy, darker at the bottom) with a matching background colour |
++| `tvos-sounds/` | The default look plus navigation sounds, as an example of switching a feature on with a theme |
+ | `six-columns/` | Six smaller tiles per row and one grid row visible under the dock |
+ 
+ ## Keys
+@@ -34,6 +35,8 @@ is ignored, and a file that doesn't parse is ignored as a whole, so a theme can
+ | `module_cards` | bool | Look for module cards and ask about them (`true`); `false` turns the feature off |
+ | `reduced_motion` | bool | Calmer motion for weak GPUs: stiff highlight spring, no tile overshoot, short fades, no entrance replay |
+ | `vpn_app` | string | App the network pill opens when a VPN is configured; also shows a red "VPN off" badge while no VPN is up |
++| `hero_art` | bool | Top shelf artwork from a high resolution banner in `banners/` (see `tools/banners.sh`); on by default, does nothing without banners |
++| `navigation_sounds` | bool | A soft tick when the highlight moves and a chime when an app opens, synthesised on the TV; off by default |
+ | `show_home_settings_shortcut` | bool | The "Default home" tile, where the TV has a home picker |
+ | `background_color` | `#RRGGBB` | Colour behind everything; black by default |
+ | `wallpaper` | bool | Show `wallpaper.jpg` from the theme folder (`true`), or ignore it (`false`) |
+diff --git a/themes/tvos-sounds/config.json b/themes/tvos-sounds/config.json
+new file mode 100644
+index 0000000..52310b4
+--- /dev/null
++++ b/themes/tvos-sounds/config.json
+@@ -0,0 +1,3 @@
++{
++  "navigation_sounds": true
++}
+diff --git a/tools/banners.ps1 b/tools/banners.ps1
+new file mode 100644
+index 0000000..667d673
+--- /dev/null
++++ b/tools/banners.ps1
+@@ -0,0 +1,41 @@
++# Windows version of banners.sh: push high resolution banners (one image per app, named after its package,
++# e.g. com.netflix.ninja.png; png, jpg or webp, 16:9, under 6 MB) to the launcher and restart Home.
++#
++# Usage: tools\banners.ps1 -TvHost 192.168.1.50 my-banners
++#        tools\banners.ps1 -TvHost 192.168.1.50 -Reset
++param(
++    [Parameter(Position = 0)][string]$Folder,
++    [switch]$Reset,
++    [string]$TvHost = $env:TV_HOST
++)
++$ErrorActionPreference = 'Stop'
++$OutputEncoding = New-Object System.Text.UTF8Encoding $false
++if (-not $TvHost) { throw 'pass -TvHost <tv ip> or set $env:TV_HOST' }
++$env:TV_HOST = $TvHost
++if ($Folder) { $Folder = (Resolve-Path $Folder).Path }
++Set-Location $PSScriptRoot
++$py = 'venv\Scripts\python.exe'
++if (-not (Test-Path $py)) { throw 'run: python -m venv tools\venv; tools\venv\Scripts\python.exe -m pip install -r tools\requirements.txt' }
++$pkg = 'com.gathin.tvhome'
++$dir = "/sdcard/Android/data/$pkg/files/banners"
++
++if ($Reset) {
++    & $py -I tv.py "rm -rf $dir; am force-stop $pkg; am start -n $pkg/.MainActivity >/dev/null; echo reset"
++    exit 0
++}
++if (-not $Folder -or -not (Test-Path $Folder -PathType Container)) { throw 'usage: banners.ps1 <folder of <package>.png|jpg|webp> | -Reset' }
++
++& $py -I tv.py "mkdir -p $dir" | Out-Null
++$n = 0
++foreach ($f in Get-ChildItem -File $Folder) {
++    $ext = $f.Extension.ToLower()
++    if ($ext -notin '.png', '.jpg', '.jpeg', '.webp') { Write-Host "skip $($f.Name) (png, jpg or webp only)"; continue }
++    $name = [IO.Path]::GetFileNameWithoutExtension($f.Name)
++    if ($name -notmatch '\.') { Write-Host "skip $($f.Name): name the file after the package, e.g. com.netflix.ninja.png"; continue }
++    if ($f.Length -gt 6291456) { Write-Host "skip $($f.Name): over 6 MB"; continue }
++    & $py -I b64push.py $f.FullName "$dir/$($f.Name)" | Select-Object -Last 1
++    if ($LASTEXITCODE -ne 0) { throw "upload of $($f.Name) failed" }
++    $n++
++}
++& $py -I tv.py "am force-stop $pkg; am start -n $pkg/.MainActivity >/dev/null; echo applied"
++Write-Host "$n banner(s) on the TV. Undo with: tools\banners.ps1 -TvHost $TvHost -Reset"
+diff --git a/tools/banners.sh b/tools/banners.sh
+new file mode 100755
+index 0000000..44a3e7c
+--- /dev/null
++++ b/tools/banners.sh
+@@ -0,0 +1,48 @@
++#!/usr/bin/env bash
++# Push high resolution banners to the launcher on the TV. Put one image per app in a folder, named
++# after the app's package: com.netflix.ninja.png, com.google.android.youtube.tv.jpg ... (png, jpg or
++# webp, 16:9, 1280x720 is plenty, under 6 MB). They replace the app's own banner on its tile, and the
++# focused dock app's banner also fills the top shelf behind the dock.
++#
++# Usage: TV_HOST=192.168.1.50 tools/banners.sh my-banners
++#        TV_HOST=192.168.1.50 tools/banners.sh --reset      # remove them all, back to the apps' own banners
++set -euo pipefail
++ARG="${1:-}"
++case "$ARG" in --reset|"") ;; /*) ;; *) ARG="$PWD/$ARG" ;; esac
++cd "$(dirname "$0")"
++: "${TV_HOST:?set TV_HOST to the TV IP address, e.g. TV_HOST=192.168.1.50 $0 my-banners}"
++PY=venv/bin/python
++[ -x "$PY" ] || PY=venv/Scripts/python.exe
++[ -x "$PY" ] || { echo "run: python3 -m venv tools/venv && tools/venv/bin/pip install -r tools/requirements.txt" >&2; exit 1; }
++export MSYS_NO_PATHCONV=1
++PKG=com.gathin.tvhome
++DIR=/sdcard/Android/data/$PKG/files/banners
++tv() { "$PY" -I tv.py "$@"; }
++
++if [ "$ARG" = --reset ]; then
++  tv "rm -rf $DIR; am force-stop $PKG; am start -n $PKG/.MainActivity >/dev/null; echo reset" | tail -n 1
++  exit 0
++fi
++[ -n "$ARG" ] && [ -d "$ARG" ] || { echo "usage: banners.sh <folder of <package>.png|jpg|webp> | --reset" >&2; exit 1; }
++
++tv "mkdir -p $DIR" >/dev/null
++n=0
++for f in "$ARG"/*; do
++  [ -f "$f" ] || continue
++  name=$(basename "$f")
++  case "$name" in
++    *.png|*.jpg|*.jpeg|*.webp) ;;
++    *) echo "skip $name (png, jpg or webp only)"; continue ;;
++  esac
++  pkg="${name%.*}"
++  case "$pkg" in
++    *.*) ;;
++    *) echo "skip $name: name the file after the package, e.g. com.netflix.ninja.png"; continue ;;
++  esac
++  size=$(wc -c < "$f" | tr -d ' ')
++  [ "$size" -le 6291456 ] || { echo "skip $name: over 6 MB"; continue; }
++  "$PY" -I b64push.py "$f" "$DIR/$name" | tail -n 1
++  n=$((n + 1))
++done
++tv "am force-stop $PKG; am start -n $PKG/.MainActivity >/dev/null; echo applied" | tail -n 1
++echo "$n banner(s) on the TV. Undo with: tools/banners.sh --reset"

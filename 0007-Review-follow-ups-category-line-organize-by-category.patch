@@ -1,0 +1,501 @@
+From 708db45a2ef901cc0da069bfcba13a35e5d6194a Mon Sep 17 00:00:00 2001
+From: dev <dev@local>
+Date: Tue, 20 Oct 2026 16:50:51 +0000
+Subject: [PATCH 7/7] Review follow-ups: category line, organize by category,
+ scale-up launch, back to start, press and bump sounds, locale sort
+
+---
+ README.md                                     |  2 +
+ .../java/com/gathin/tvhome/AppAdapter.java    | 55 +++++++++++++-
+ .../main/java/com/gathin/tvhome/Config.java   |  8 +++
+ .../java/com/gathin/tvhome/MainActivity.java  | 72 +++++++++++++++++--
+ .../java/com/gathin/tvhome/NavSounds.java     | 41 ++++++++++-
+ .../app/src/main/res/layout/activity_main.xml | 16 +++++
+ .../app/src/main/res/values-tr/strings.xml    |  9 +++
+ launcher/app/src/main/res/values/strings.xml  |  9 +++
+ 8 files changed, 202 insertions(+), 10 deletions(-)
+
+diff --git a/README.md b/README.md
+index 3fc2afd..90f9143 100644
+--- a/README.md
++++ b/README.md
+@@ -215,6 +215,8 @@ the install script finds `~/Android/Sdk` and the `java` on your PATH.
+ - **Language** follows the TV: English, German, Spanish, Catalan, French, Russian, Serbian (Latin), Polish, Arabic, Simplified Chinese, Thai, Turkish. Android 13+ can set it for the launcher alone: `tools/tv.py 'cmd locale set-app-locales com.gathin.tvhome --locales ca'`.
+   Russian includes the module-card approval and management screens and the VPN-off badge.
+ - **Edit Home on the TV**: hold OK on a tile for a menu. *Move* picks the tile up (arrow keys move it, OK puts it down; the first row is the dock). *New folder with ...* and *Add to ...* group apps into a folder tile that shows up to four of their icons; OK opens it, and holding OK on an app inside takes it out again. *Hide* removes an app from Home, *App info* opens its Settings page. On a folder tile: *Rename* and *Dissolve folder*. *Show hidden apps* and *Reset home layout* appear in the menu once there is something to undo. Saved in the launcher's private storage, so a theme push does not touch it.
++- **Category line and auto folders**: the focused dock app's category ("Games", "Video", "Music"...) appears in small capitals above its name when the app declares one. *Organize by category* in the hold-OK menu makes one folder per category from the apps below the dock (two or more apps each); the dock stays as it is.
++- **tvOS details**: an app opens by growing out of its tile; Back walks back to the first dock tile instead of doing nothing; app names sort by the TV's language (a Turkish "Çocuk" no longer lands after "Z"); switching animations off in Developer options switches reduced motion on. With navigation sounds on, OK down taps and a key that hits the edge of the grid bumps.
+ - **Navigation sounds** (off by default): a soft tick as the highlight moves and a chime when an app opens, synthesised on the TV, no audio files. Switch on with `navigation_sounds` in `config.xml` or `tools/theme.sh themes/tvos-sounds`.
+ - **Module cards** let any TV app declare its own tile (label, caption, glow). The launcher asks you once per app, Keep hidden by default, and remembers the answer for that app's signing key and card name. Hold OK on Settings to change your mind. How to make one: [`docs/modules.md`](docs/modules.md); the contract: [`docs/specs/card.md`](docs/specs/card.md).
+ - **Clock screensaver**: a drifting clock over the glow, so nothing burns in. Pick "Clock" in the TV's screensaver settings, or over ADB:
+diff --git a/launcher/app/src/main/java/com/gathin/tvhome/AppAdapter.java b/launcher/app/src/main/java/com/gathin/tvhome/AppAdapter.java
+index 41e4009..8c7bf2f 100644
+--- a/launcher/app/src/main/java/com/gathin/tvhome/AppAdapter.java
++++ b/launcher/app/src/main/java/com/gathin/tvhome/AppAdapter.java
+@@ -4,6 +4,8 @@ import android.content.ActivityNotFoundException;
+ import android.content.ComponentName;
+ import android.content.Context;
+ import android.content.Intent;
++import android.app.ActivityOptions;
++import android.content.pm.ApplicationInfo;
+ import android.content.pm.PackageManager;
+ import android.content.pm.ResolveInfo;
+ import android.content.res.Resources;
+@@ -16,6 +18,7 @@ import android.graphics.Rect;
+ import android.graphics.drawable.BitmapDrawable;
+ import android.graphics.drawable.Drawable;
+ import android.net.Uri;
++import android.os.Bundle;
+ import android.os.SystemClock;
+ import android.provider.Settings;
+ import android.util.DisplayMetrics;
+@@ -34,6 +37,7 @@ import androidx.annotation.NonNull;
+ import androidx.recyclerview.widget.RecyclerView;
+ 
+ import java.io.File;
++import java.text.Collator;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collections;
+@@ -79,6 +83,8 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
+         File art;
+         /** For a FOLDER tile: its id in {@link HomeLayout}. */
+         String folderId;
++        /** The app's declared category (ApplicationInfo.CATEGORY_*), or -1 when it declares none. */
++        int category = -1;
+ 
+         Entry(String label, ComponentName component, Drawable banner, Drawable icon) {
+             this(APP, label, component, banner, icon, null, 0);
+@@ -209,8 +215,13 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
+                 entry = new Entry(Cards.cleanLabel(String.valueOf(ri.loadLabel(pm)), pkg), component, banner, icon);
+             }
+             entry.art = art;
++            entry.category = categoryOf(ri.activityInfo.applicationInfo);
+             fresh.add(entry);
+         }
++        // The TV's language decides the order of letters: with plain compareToIgnoreCase a Turkish
++        // "Çocuk" or "Şarkı" would land after "Z".
++        final Collator collator = Collator.getInstance();
++        collator.setStrength(Collator.PRIMARY);
+         Collections.sort(fresh, (a, b) -> {
+             int fa = favourites.indexOf(a.pkg), fb = favourites.indexOf(b.pkg);
+             if (fa >= 0 || fb >= 0) {
+@@ -221,7 +232,7 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
+             // Cards come right after the configured dock apps, before the alphabetical grid.
+             boolean ca = a.kind == Entry.CARD, cb = b.kind == Entry.CARD;
+             if (ca != cb) return ca ? -1 : 1;
+-            return a.label.compareToIgnoreCase(b.label);
++            return collator.compare(a.label, b.label);
+         });
+         // Optional "Default home" tile (config.xml), only when this TV actually has a home-screen picker.
+         if (showHomeSettings
+@@ -406,7 +417,7 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
+             h.label.setText(e.label);
+             h.label.setVisibility(View.VISIBLE);
+         }
+-        h.card.setOnClickListener(v -> launch(e));
++        h.card.setOnClickListener(v -> launch(e, v));
+         h.card.setOnLongClickListener(v -> {
+             // The key release goes to the menu, so undo the press here.
+             if (!reducedMotion && v.isFocused()) v.animate().scaleX(FOCUS_SCALE).scaleY(FOCUS_SCALE).setDuration(120).start();
+@@ -418,6 +429,11 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
+ 
+     /** Opens the tile's activity by explicit component, with no extras: a card can name nothing else. */
+     void launch(Entry e) {
++        launch(e, null);
++    }
++
++    /** {@code from}, when given, is the tile the app opens from: it grows out of that tile, tvOS style. */
++    void launch(Entry e, View from) {
+         NavSounds.select();
+         if (e.kind == Entry.FOLDER) {
+             if (listener != null) listener.onFolderOpen(e.folderId);
+@@ -433,7 +449,11 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
+                 .setComponent(e.component)
+                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+         try {
+-            ctx.startActivity(i);
++            Bundle opts = null;
++            if (!reducedMotion && from != null && from.getWidth() > 0) {
++                opts = ActivityOptions.makeScaleUpAnimation(from, 0, 0, from.getWidth(), from.getHeight()).toBundle();
++            }
++            ctx.startActivity(i, opts);
+         } catch (Exception ex) {
+             Toast.makeText(ctx, ctx.getString(R.string.cant_open, e.label), Toast.LENGTH_SHORT).show();
+         }
+@@ -467,6 +487,34 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
+         return position >= 0 && position < items.size() ? items.get(position).label : "";
+     }
+ 
++    /** What the app says it is, or -1: ApplicationInfo.category, or the older games flag. */
++    @SuppressWarnings("deprecation")
++    static int categoryOf(ApplicationInfo ai) {
++        if (ai == null) return -1;
++        if (ai.category != ApplicationInfo.CATEGORY_UNDEFINED) return ai.category;
++        return (ai.flags & ApplicationInfo.FLAG_IS_GAME) != 0 ? ApplicationInfo.CATEGORY_GAME : -1;
++    }
++
++    /** The string resource naming a category, or 0 for one the Home screen does not show. */
++    static int categoryName(int category) {
++        switch (category) {
++            case ApplicationInfo.CATEGORY_GAME: return R.string.category_game;
++            case ApplicationInfo.CATEGORY_VIDEO: return R.string.category_video;
++            case ApplicationInfo.CATEGORY_AUDIO: return R.string.category_audio;
++            case ApplicationInfo.CATEGORY_IMAGE: return R.string.category_image;
++            case ApplicationInfo.CATEGORY_SOCIAL: return R.string.category_social;
++            case ApplicationInfo.CATEGORY_NEWS: return R.string.category_news;
++            case ApplicationInfo.CATEGORY_MAPS: return R.string.category_maps;
++            case ApplicationInfo.CATEGORY_PRODUCTIVITY: return R.string.category_productivity;
++            default: return 0;
++        }
++    }
++
++    /** The category of the app at this position, or -1 (folders and cards of unknown apps have none). */
++    int categoryAt(int position) {
++        return position >= 0 && position < items.size() ? items.get(position).category : -1;
++    }
++
+     /** The high resolution banner file behind the tile at this position, or null. */
+     File artAt(int position) {
+         return position >= 0 && position < items.size() ? items.get(position).art : null;
+@@ -563,6 +611,7 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
+                     // Press: sink while OK is held, spring back on release. The click still fires on release.
+                     float p = FOCUS_SCALE * PRESS_SCALE;
+                     if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
++                        NavSounds.press();
+                         view.animate().cancel();
+                         view.animate().scaleX(p).scaleY(p).setDuration(90)
+                                 .setInterpolator(new DecelerateInterpolator()).withLayer().start();
+diff --git a/launcher/app/src/main/java/com/gathin/tvhome/Config.java b/launcher/app/src/main/java/com/gathin/tvhome/Config.java
+index ec5c0f2..0bb2bf7 100644
+--- a/launcher/app/src/main/java/com/gathin/tvhome/Config.java
++++ b/launcher/app/src/main/java/com/gathin/tvhome/Config.java
+@@ -3,6 +3,7 @@ package com.gathin.tvhome;
+ import android.content.Context;
+ import android.content.res.Resources;
+ import android.graphics.Color;
++import android.provider.Settings;
+ import android.util.Log;
+ 
+ import org.json.JSONArray;
+@@ -133,6 +134,13 @@ final class Config {
+             sounds = bool(json, "navigation_sounds", sounds);
+             background = color(json, "background_color", background);
+         }
++        // Animations switched off system wide (Developer options, animator duration scale 0): calm motion too.
++        try {
++            if (Settings.Global.getFloat(ctx.getContentResolver(), Settings.Global.ANIMATOR_DURATION_SCALE, 1f) == 0f) {
++                reducedMotion = true;
++            }
++        } catch (Exception ignored) {
++        }
+         File wallpaper = dir != null ? new File(dir, WALLPAPER_NAME) : null;
+         if (wallpaper != null && !(wallpaper.isFile() && wallpaper.length() > 0)) wallpaper = null;
+         // A theme can also switch the wallpaper off while the file is still there.
+diff --git a/launcher/app/src/main/java/com/gathin/tvhome/MainActivity.java b/launcher/app/src/main/java/com/gathin/tvhome/MainActivity.java
+index df2f8f8..4b8f945 100644
+--- a/launcher/app/src/main/java/com/gathin/tvhome/MainActivity.java
++++ b/launcher/app/src/main/java/com/gathin/tvhome/MainActivity.java
+@@ -95,6 +95,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+     private GlassView glass;
+     private View ambient;
+     private TextView heroName;
++    private TextView heroCategory;
+     // Top shelf artwork (config hero_art): a high resolution banner decoded off the main thread.
+     private View heroArtGroup;
+     private ImageView heroArt;
+@@ -222,6 +223,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+         glass = findViewById(R.id.glass);
+         ambient = findViewById(R.id.ambient);
+         heroName = findViewById(R.id.heroName);
++        heroCategory = findViewById(R.id.heroCategory);
+         heroArtGroup = findViewById(R.id.heroArtGroup);
+         heroArt = findViewById(R.id.heroArt);
+         heroArtEnabled = cfg.heroArt && !cfg.reducedMotion;   // a full screen fade is what reduced motion avoids
+@@ -431,6 +433,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+             glass.setAlpha(0f);
+             heroShown = false;
+             heroName.setAlpha(0f);
++            heroCategory.setAlpha(0f);
+             ambient.setAlpha(0f);
+             hideHeroArt();
+         }
+@@ -520,7 +523,11 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+ 
+     @Override
+     public void onBackPressed() {
+-        // Home screen: Back goes nowhere.
++        // Home screen: Back never leaves Home. From anywhere but the first dock tile it walks back to it
++        // (from the grid, from the top bar), like Back on tvOS; on the first tile it does nothing.
++        View f = getCurrentFocus();
++        boolean onFirst = f != null && f.getId() == R.id.card && lastFocused == 0;
++        if (!onFirst && adapter.getItemCount() > 0) focusTile(0);
+     }
+ 
+     // ---- glass highlight -------------------------------------------------------------------------
+@@ -587,6 +594,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+         String label = adapter.labelAt(position);
+         int color = adapter.ambientColorAt(position);
+         float y = dockTopInRoot - 14 * density - 26 * density - heroName.getHeight();
++        showHeroCategory(adapter.categoryAt(position), y);
+         boolean changed = !label.contentEquals(heroName.getText());
+ 
+         if (reducedMotion) {
+@@ -632,6 +640,20 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+         }
+     }
+ 
++    /** The small category line above the app's name; nothing for an app that declares none. */
++    private void showHeroCategory(int category, float nameY) {
++        int res = AppAdapter.categoryName(category);
++        if (res == 0) {
++            heroCategory.animate().alpha(0f).setDuration(120).start();
++            return;
++        }
++        heroCategory.animate().cancel();
++        heroCategory.setText(res);
++        heroCategory.setY(nameY - heroCategory.getHeight() - 4 * density);
++        heroCategory.setAlpha(reducedMotion ? 1f : heroCategory.getAlpha());
++        if (!reducedMotion) heroCategory.animate().alpha(1f).setDuration(260).start();
++    }
++
+     /** Fades the focused dock app's high resolution banner in behind the dock; null (no banner) fades it out. */
+     private void showHeroArt(File file) {
+         if (!heroArtEnabled) return;
+@@ -700,6 +722,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+     private void hideHero() {
+         if (!heroShown) return;
+         hideHeroArt();
++        heroCategory.animate().alpha(0f).setDuration(reducedMotion ? 100 : 160).start();
+         heroShown = false;
+         heroName.animate().alpha(0f).setDuration(reducedMotion ? 100 : 160).start();
+         ambient.animate().alpha(0f).setDuration(reducedMotion ? 140 : 300).start();
+@@ -720,17 +743,24 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+         // Horizontal: swallow the key at a row's ends so focus never wraps to the next row or
+         // escapes up into the top bar. Mid-row moves fall through to the default focus search.
+         if (keyCode == KeyEvent.KEYCODE_DPAD_LEFT) {
+-            return position % COLUMNS == 0;
++            boolean edge = position % COLUMNS == 0;
++            if (edge) NavSounds.bump();
++            return edge;
+         }
+         if (keyCode == KeyEvent.KEYCODE_DPAD_RIGHT) {
+-            return position % COLUMNS == COLUMNS - 1 || position == count - 1;
++            boolean edge = position % COLUMNS == COLUMNS - 1 || position == count - 1;
++            if (edge) NavSounds.bump();
++            return edge;
+         }
+         if (keyCode == KeyEvent.KEYCODE_DPAD_UP) {
+             if (position < COLUMNS) return false;          // dock row: let focus move to the top bar
+             target = position - COLUMNS;
+         } else {
+             int lastRowStart = ((count - 1) / COLUMNS) * COLUMNS;
+-            if (position >= lastRowStart) return true;     // already on the last row: stay put
++            if (position >= lastRowStart) {                // already on the last row: stay put
++                NavSounds.bump();
++                return true;
++            }
+             target = Math.min(position + COLUMNS, count - 1);
+         }
+         focusTile(target);
+@@ -1121,6 +1151,9 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+                 reloadTiles();
+                 restoreFocus();
+             });
++            if (organizeGroups().size() > 0) {
++                addInputRow(rows, popup, R.drawable.ic_folder, getString(R.string.menu_organize), -1, this::organizeByCategory);
++            }
+             addInputRow(rows, popup, R.drawable.ic_info, getString(R.string.menu_app_info), -1,
+                     () -> open(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + e.pkg))));
+         }
+@@ -1148,6 +1181,37 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+         rows.getChildAt(1).requestFocus();   // child 0 is the title
+     }
+ 
++    /**
++     * The apps below the dock that declare the same category, for every category with at least two of them
++     * and not already in a folder. The dock apps stay where they are.
++     */
++    private java.util.Map<Integer, List<String>> organizeGroups() {
++        java.util.Map<Integer, List<String>> groups = new java.util.TreeMap<>();
++        for (int i = COLUMNS; i < adapter.getItemCount(); i++) {
++            AppAdapter.Entry en = adapter.entryAt(i);
++            if (en == null || en.kind != AppAdapter.Entry.APP || AppAdapter.categoryName(en.category) == 0) continue;
++            if (layout.folderOf(en.pkg) != null) continue;
++            List<String> list = groups.get(en.category);
++            if (list == null) groups.put(en.category, list = new ArrayList<>());
++            if (!list.contains(en.pkg)) list.add(en.pkg);
++        }
++        java.util.Iterator<java.util.Map.Entry<Integer, List<String>>> it = groups.entrySet().iterator();
++        while (it.hasNext()) if (it.next().getValue().size() < 2) it.remove();
++        return groups;
++    }
++
++    /** One folder per category (Games, Video, Music...), named in the TV's language. */
++    private void organizeByCategory() {
++        for (java.util.Map.Entry<Integer, List<String>> g : organizeGroups().entrySet()) {
++            List<String> pkgs = g.getValue();
++            HomeLayout.Folder f = layout.newFolder(getString(AppAdapter.categoryName(g.getKey())), pkgs.get(0));
++            if (f == null) break;   // the folder limit
++            for (int i = 1; i < pkgs.size(); i++) layout.addToFolder(f, pkgs.get(i));
++        }
++        reloadTiles();
++        restoreFocus();
++    }
++
+     /** After a folder was made, renamed or added to: rebuild the tiles and focus the folder's tile. */
+     private void finishFolderChange(String folderId) {
+         reloadTiles();
+diff --git a/launcher/app/src/main/java/com/gathin/tvhome/NavSounds.java b/launcher/app/src/main/java/com/gathin/tvhome/NavSounds.java
+index 2f0e15e..0cd8e65 100644
+--- a/launcher/app/src/main/java/com/gathin/tvhome/NavSounds.java
++++ b/launcher/app/src/main/java/com/gathin/tvhome/NavSounds.java
+@@ -14,7 +14,7 @@ final class NavSounds {
+     private static final String TAG = "TvHome.Sounds";
+     private static final int RATE = 22050;
+ 
+-    private static AudioTrack tick, select;
++    private static AudioTrack tick, select, press, bump;
+     private static boolean on;
+ 
+     private NavSounds() {
+@@ -26,7 +26,9 @@ final class NavSounds {
+         try {
+             tick = build(burst(1900, 26, 0.30f));
+             select = build(chime());
+-            on = tick != null && select != null;
++            press = build(pressTone());
++            bump = build(bumpSweep());
++            on = tick != null && select != null && press != null && bump != null;
+         } catch (Exception | LinkageError e) {
+             Log.w(TAG, "sounds off: " + e);
+             release();
+@@ -35,7 +37,7 @@ final class NavSounds {
+ 
+     static void release() {
+         on = false;
+-        for (AudioTrack t : new AudioTrack[]{tick, select}) {
++        for (AudioTrack t : new AudioTrack[]{tick, select, press, bump}) {
+             if (t != null) {
+                 try {
+                     t.release();
+@@ -45,6 +47,8 @@ final class NavSounds {
+         }
+         tick = null;
+         select = null;
++        press = null;
++        bump = null;
+     }
+ 
+     /** The highlight moved. */
+@@ -52,6 +56,16 @@ final class NavSounds {
+         play(tick);
+     }
+ 
++    /** OK went down on a tile: a lower, rounder tap. */
++    static void press() {
++        play(press);
++    }
++
++    /** A key hit the edge of the grid and went nowhere: a short falling blip. */
++    static void bump() {
++        play(bump);
++    }
++
+     /** An app was opened. */
+     static void select() {
+         play(select);
+@@ -103,6 +117,27 @@ final class NavSounds {
+         return out;
+     }
+ 
++    private static short[] pressTone() {
++        short[] out = new short[RATE * 80 / 1000];
++        mix(out, 0, 784, 0.26f, 5.0);
++        mix(out, 0, 392, 0.12f, 5.0);
++        return out;
++    }
++
++    /** A sine that falls from 700 to 320 Hz over 110 ms. */
++    private static short[] bumpSweep() {
++        short[] out = new short[RATE * 110 / 1000];
++        double phase = 0;
++        for (int i = 0; i < out.length; i++) {
++            double t = (double) i / out.length;
++            double hz = 700 - 380 * t;
++            phase += 2 * Math.PI * hz / RATE;
++            double env = Math.min(1.0, i / (RATE * 0.004)) * Math.exp(-5.0 * t);
++            out[i] = (short) (0.22 * env * Math.sin(phase) * Short.MAX_VALUE);
++        }
++        return out;
++    }
++
+     /** Adds a faded sine starting at sample {@code from} and running to the end of the buffer. */
+     private static void mix(short[] buf, int from, double hz, float amp, double decay) {
+         int n = buf.length - from;
+diff --git a/launcher/app/src/main/res/layout/activity_main.xml b/launcher/app/src/main/res/layout/activity_main.xml
+index 9f8c1bf..2e6144f 100644
+--- a/launcher/app/src/main/res/layout/activity_main.xml
++++ b/launcher/app/src/main/res/layout/activity_main.xml
+@@ -34,6 +34,22 @@
+         android:layout_height="match_parent"
+         android:alpha="0" />
+ 
++    <!-- Top shelf: the app's category ("Games", "Video") in small capitals above its name, positioned in code. -->
++    <TextView
++        android:id="@+id/heroCategory"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:layout_marginStart="70dp"
++        android:alpha="0"
++        android:textColor="#A6FFFFFF"
++        android:textSize="12sp"
++        android:fontFamily="@font/outfit"
++        android:fontVariationSettings="'wght' 500"
++        android:letterSpacing="0.2"
++        android:includeFontPadding="false"
++        android:singleLine="true"
++        android:textAllCaps="true" />
++
+     <!-- Top shelf: the focused dock app's name, positioned above the dock in code. -->
+     <TextView
+         android:id="@+id/heroName"
+diff --git a/launcher/app/src/main/res/values-tr/strings.xml b/launcher/app/src/main/res/values-tr/strings.xml
+index b753c2e..6411ff3 100644
+--- a/launcher/app/src/main/res/values-tr/strings.xml
++++ b/launcher/app/src/main/res/values-tr/strings.xml
+@@ -62,4 +62,13 @@
+     <string name="rename_title">Klasör adı</string>
+     <string name="rename_ok">Tamam</string>
+     <string name="rename_cancel">İptal</string>
++    <string name="category_game">Oyunlar</string>
++    <string name="category_video">Video</string>
++    <string name="category_audio">Müzik</string>
++    <string name="category_image">Fotoğraflar</string>
++    <string name="category_social">Sosyal</string>
++    <string name="category_news">Haberler</string>
++    <string name="category_maps">Haritalar</string>
++    <string name="category_productivity">Verimlilik</string>
++    <string name="menu_organize">Kategoriye göre düzenle</string>
+ </resources>
+diff --git a/launcher/app/src/main/res/values/strings.xml b/launcher/app/src/main/res/values/strings.xml
+index febae60..bf14e8b 100644
+--- a/launcher/app/src/main/res/values/strings.xml
++++ b/launcher/app/src/main/res/values/strings.xml
+@@ -62,4 +62,13 @@
+     <string name="rename_title">Folder name</string>
+     <string name="rename_ok">OK</string>
+     <string name="rename_cancel">Cancel</string>
++    <string name="category_game">Games</string>
++    <string name="category_video">Video</string>
++    <string name="category_audio">Music</string>
++    <string name="category_image">Photos</string>
++    <string name="category_social">Social</string>
++    <string name="category_news">News</string>
++    <string name="category_maps">Maps</string>
++    <string name="category_productivity">Productivity</string>
++    <string name="menu_organize">Organize by category</string>
+ </resources>
+-- 
+2.43.0
+

@@ -1,0 +1,144 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/root_container"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#FF08090C"
+    android:clipChildren="false"
+    android:clipToPadding="false">
+
+    <!-- 1. KATMAN: HERO BANNER (TOP SHELF) VİTRİN ALANI -->
+    <FrameLayout
+        android:id="@+id/hero_stage_container"
+        android:layout_width="match_parent"
+        android:layout_height="440dp"
+        android:layout_gravity="top">
+
+        <!-- Ana Hero Görseli -->
+        <ImageView
+            android:id="@+id/hero_banner_primary"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:scaleType="centerCrop"
+            android:contentDescription="@null" />
+
+        <!-- Crossfade & Ken Burns Geçişi İçin İkinci Katman -->
+        <ImageView
+            android:id="@+id/hero_banner_secondary"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:alpha="0"
+            android:scaleType="centerCrop"
+            android:visibility="invisible"
+            android:contentDescription="@null" />
+
+        <!-- Sol Karartma Katmanı (Java'dan Programatik Gradyan Atanır) -->
+        <View
+            android:id="@+id/hero_scrim_left"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent" />
+
+        <!-- Alt Karartma Katmanı (Java'dan Programatik Gradyan Atanır) -->
+        <View
+            android:id="@+id/hero_scrim_bottom"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent" />
+
+        <!-- Dinamik Renkli Ambiyans Işığı (Java'dan Radial Gradyan Atanır) -->
+        <View
+            android:id="@+id/hero_accent_glow"
+            android:layout_width="480dp"
+            android:layout_height="280dp"
+            android:layout_gravity="bottom|start"
+            android:layout_marginStart="-60dp"
+            android:layout_marginBottom="20dp"
+            android:alpha="0.32" />
+
+        <!-- Hero Metin Bloğu (Sol Alt) -->
+        <LinearLayout
+            android:layout_width="560dp"
+            android:layout_height="wrap_content"
+            android:layout_gravity="bottom|start"
+            android:layout_marginStart="56dp"
+            android:layout_marginBottom="96dp"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/hero_badge"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:fontFamily="sans-serif-medium"
+                android:letterSpacing="0.14"
+                android:paddingHorizontal="12dp"
+                android:paddingVertical="4dp"
+                android:text="APPLE TV VİTRİN"
+                android:textColor="#E6FFFFFF"
+                android:textSize="10sp" />
+
+            <TextView
+                android:id="@+id/hero_title"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:ellipsize="end"
+                android:fontFamily="sans-serif-black"
+                android:maxLines="1"
+                android:shadowColor="#CC000000"
+                android:shadowDx="0"
+                android:shadowDy="4"
+                android:shadowRadius="12"
+                android:text="Stremio"
+                android:textColor="#FFFFFFFF"
+                android:textSize="40sp" />
+
+            <TextView
+                android:id="@+id/hero_subtitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:alpha="0.85"
+                android:ellipsize="end"
+                android:fontFamily="sans-serif"
+                android:lineSpacingExtra="3dp"
+                android:maxLines="2"
+                android:text="4K HDR Sinema • Tüm Kütüphaneniz ve Eklentileriniz Tek Merkezde"
+                android:textColor="#E6EBF5"
+                android:textSize="15sp" />
+        </LinearLayout>
+    </FrameLayout>
+
+    <!-- 2. KATMAN: tvOS BUZLU CAM DOCK VE UYGULAMA SATIRI -->
+    <LinearLayout
+        android:id="@+id/apps_shelf_container"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:layout_marginTop="340dp"
+        android:clipChildren="false"
+        android:clipToPadding="false"
+        android:orientation="vertical"
+        android:paddingTop="12dp">
+
+        <FrameLayout
+            android:id="@+id/tvos_frosted_dock"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginHorizontal="42dp"
+            android:clipChildren="false"
+            android:clipToPadding="false"
+            android:paddingVertical="14dp">
+
+            <androidx.recyclerview.widget.RecyclerView
+                android:id="@+id/apps_recycler_view"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:clipChildren="false"
+                android:clipToPadding="false"
+                android:descendantFocusability="afterDescendants"
+                android:focusable="true"
+                android:overScrollMode="never"
+                android:paddingHorizontal="18dp"
+                android:paddingVertical="10dp" />
+        </FrameLayout>
+    </LinearLayout>
+
+</FrameLayout>
