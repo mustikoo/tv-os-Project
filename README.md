@@ -123,3 +123,15 @@ Notes for a model that has no tested list yet live in [`docs/devices/`](../docs/
 
 To add your TV, see [CONTRIBUTING.md](../CONTRIBUTING.md). The quickest way to get a list is to
 run the prompt in [PROMPT.md](../PROMPT.md) and copy the packages your assistant disabled.
+
+## Launcher UI profile (Apollo Premium4K baseline)
+
+The bundled launcher is tuned for a tvOS-style experience on TVs that output 4K/60 while running a 1920x1080 app surface.
+It does not force display refresh rate; it targets smooth 60-FPS-capable rendering by reducing heavy transitions and capping hero artwork decode width.
+
+### On-device validation checklist
+
+- Stress focus navigation with rapid D-pad movement across rows and confirm no stale hero swaps.
+- Verify folder/category navigation still behaves deterministically.
+- Check motion/sound/theme/wallpaper settings from avatar long-press settings menu.
+- Collect frame metrics with `dumpsys gfxinfo com.gathin.tvhome` and review jank percentiles around the 16.67 ms budget.
