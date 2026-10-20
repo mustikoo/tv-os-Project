@@ -2,11 +2,17 @@ package com.gathin.tvhome;
 
 import android.animation.ValueAnimator;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.app.ActivityOptions;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
 import android.graphics.Outline;
+import android.graphics.PixelFormat;
+import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.media.AudioAttributes;
@@ -16,7 +22,6 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
-import android.os.SystemClock;
 import android.provider.Settings;
 import android.text.TextUtils;
 import android.util.SparseIntArray;
@@ -28,7 +33,6 @@ import android.view.ViewGroup;
 import android.view.ViewOutlineProvider;
 import android.view.ViewParent;
 import android.view.animation.DecelerateInterpolator;
-import android.view.animation.OvershootInterpolator;
 import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
@@ -68,28 +72,42 @@ public class TvHomeActivity extends Activity {
     // ═══════════════════════════════════════════════════════════════
     //  KONFIGÜRASYON — tüm tvOS değerleri burada
     // ═══════════════════════════════════════════════════════════════
-    private static final int    C_BG           = 0xFF0A0A0F;
-    private static final int    C_CARD         = 0xFF1C1C24;
-    private static final int    C_TEXT         = 0xFFF5F5F7;
-
-    private static final float  FOCUS_SCALE    = 1.10f;
-    private static final float  PRESS_SCALE    = 0.95f;
-    private static final float  TILT_DEG       = 5f;
-    private static final long   TILT_WINDOW_MS = 150;
+    // Apollo Premium4K için: 4K/60 çıkış korunurken launcher yüzeyi 1080p'de 60 FPS hedefler.
+    private static final float  FOCUS_SCALE    = LauncherPerfProfile.FOCUS_SCALE;
+    private static final float  PRESS_SCALE    = 0.96f;
+    private static final long   FOCUS_ANIM_MS  = LauncherPerfProfile.FOCUS_ANIM_MS;
+    private static final long   UNFOCUS_ANIM_MS = LauncherPerfProfile.UNFOCUS_ANIM_MS;
+    private static final long   HERO_DEBOUNCE_MS = LauncherPerfProfile.HERO_DEBOUNCE_MS;
+    private static final long   HERO_FADE_OUT_MS = LauncherPerfProfile.HERO_FADE_OUT_MS;
+    private static final long   HERO_FADE_IN_MS = LauncherPerfProfile.HERO_FADE_IN_MS;
+    private static final int    HERO_MAX_WIDTH_PX = LauncherPerfProfile.HERO_MAX_DECODE_WIDTH;
+    private static final boolean NAV_SOUNDS_ENABLED_DEFAULT = false;
 
     private static final int    DP_HERO_H      = 480;
     private static final int    DP_TILE_W      = 200;
     private static final int    DP_TILE_H      = 112;
-    private static final int    DP_LABEL_H     = 34;
     private static final int    DP_TILE_GAP    = 18;
     private static final int    DP_PAD_H       = 56;
     private static final int    DP_ROW_GAP     = 26;
+    private static final String PREFS_NAME = "tvhome_ui_prefs";
+    private static final String PREF_THEME_MODE = "theme_mode";
+    private static final String PREF_WALLPAPER_MODE = "wallpaper_mode";
+    private static final String PREF_SOUND_MODE = "sound_mode";
+    private static final String PREF_MOTION_MODE = "motion_mode";
 
     // ═══════════════════════════════════════════════════════════════
     //  DURUM
     // ═══════════════════════════════════════════════════════════════
     private float density;
+    private int colorBg;
+    private int colorCard;
+    private int colorText;
+    private int colorMutedText;
+    private int colorRowActive;
+    private int colorRowInactive;
+    private int colorHeroFallback;
     private ImageView heroBanner;
+    private View heroAmbientOverlay;
     private TextView clockView;
     private ImageView avatar;
     private LinearLayout sectionsContainer;
@@ -100,9 +118,15 @@ public class TvHomeActivity extends Activity {
     private boolean reducedMotion = false;
     private AppInfo currentHeroInfo;
     private Handler clockHandler;
-
-    private static float keyDx, keyDy;
-    private static long  keyTime;
+    private Handler heroHandler;
+    private Runnable pendingHeroRunnable;
+    private int heroUpdateToken = 0;
+    private ValueAnimator ambientAnimator;
+    private SharedPreferences prefs;
+    private int themeMode;
+    private int wallpaperMode;
+    private int soundMode;
+    private int motionMode;
 
     // ═══════════════════════════════════════════════════════════════
     //  YAŞAM DÖNGÜSÜ
@@ -110,12 +134,19 @@ public class TvHomeActivity extends Activity {
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
         density = getResources().getDisplayMetrics().density;
-        reducedMotion = Settings.Global.getFloat(getContentResolver(),
+        prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        loadUserPrefs();
+        boolean systemReduced = Settings.Global.getFloat(getContentResolver(),
                 Settings.Global.ANIMATOR_DURATION_SCALE, 1f) == 0f;
-        SoundFx.init();
+        reducedMotion = LauncherUiModels.resolveReducedMotion(systemReduced, motionMode);
+        applyThemePalette();
+        applySoundMode();
         // Açılıştaki ilk otomatik odakta "tik" çalmasın.
         clockHandler = new Handler(Looper.getMainLooper());
-        clockHandler.postDelayed(() -> SoundFx.ready = true, 500);
+        heroHandler = new Handler(Looper.getMainLooper());
+        if (SoundFx.enabled) {
+            clockHandler.postDelayed(() -> SoundFx.ready = true, 500);
+        }
 
         setContentView(buildLayout());
         renderSections();
@@ -127,7 +158,49 @@ public class TvHomeActivity extends Activity {
     @Override protected void onDestroy() {
         super.onDestroy();
         if (clockHandler != null) clockHandler.removeCallbacksAndMessages(null);
+        if (heroHandler != null) heroHandler.removeCallbacksAndMessages(null);
+        if (ambientAnimator != null) ambientAnimator.cancel();
         SoundFx.release();
+    }
+
+    private void loadUserPrefs() {
+        themeMode = LauncherUiModels.normalizeTheme(
+                prefs.getInt(PREF_THEME_MODE, LauncherUiModels.THEME_CLASSIC));
+        wallpaperMode = LauncherUiModels.normalizeWallpaper(
+                prefs.getInt(PREF_WALLPAPER_MODE, LauncherUiModels.WALLPAPER_APP_BANNER));
+        soundMode = LauncherUiModels.normalizeSound(
+                prefs.getInt(PREF_SOUND_MODE,
+                        NAV_SOUNDS_ENABLED_DEFAULT ? LauncherUiModels.SOUND_SOFT : LauncherUiModels.SOUND_OFF));
+        motionMode = LauncherUiModels.normalizeMotion(
+                prefs.getInt(PREF_MOTION_MODE, LauncherUiModels.MOTION_SYSTEM));
+    }
+
+    private void savePref(String key, int value) {
+        if (prefs == null) return;
+        prefs.edit().putInt(key, value).apply();
+    }
+
+    private void applyThemePalette() {
+        LauncherUiModels.Palette palette = LauncherUiModels.paletteForTheme(themeMode);
+        colorBg = palette.bg;
+        colorCard = palette.card;
+        colorText = palette.text;
+        colorMutedText = palette.mutedText;
+        colorRowInactive = palette.rowInactive;
+        colorRowActive = palette.rowActive;
+        colorHeroFallback = palette.heroFallback;
+    }
+
+    private void applySoundMode() {
+        soundMode = LauncherUiModels.normalizeSound(soundMode);
+        if (soundMode == LauncherUiModels.SOUND_OFF) {
+            SoundFx.setEnabled(false);
+            SoundFx.setProfile(soundMode);
+            return;
+        }
+        SoundFx.setProfile(soundMode);
+        SoundFx.setEnabled(true);
+        SoundFx.init();
     }
 
     /** BACK: önce odağı sol üst karoya al; tvOS'ta home "dışarı çıkmaz". */
@@ -166,23 +239,29 @@ public class TvHomeActivity extends Activity {
     // ═══════════════════════════════════════════════════════════════
     private View buildLayout() {
         FrameLayout root = new FrameLayout(this);
-        root.setBackgroundColor(C_BG);
+        root.setBackgroundColor(colorBg);
         // NOT: setKeepScreenOn kasıtlı YOK — home ekranı daydream/uykuyu engellemesin.
 
         // --- Hero banner ---
         heroBanner = new ImageView(this);
         heroBanner.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        heroBanner.setBackgroundColor(0xFF14141C);
+        heroBanner.setBackgroundColor(colorHeroFallback);
         FrameLayout.LayoutParams heroLp = new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, dp(DP_HERO_H));
         heroLp.gravity = Gravity.TOP;
         root.addView(heroBanner, heroLp);
 
+        heroAmbientOverlay = new View(this);
+        FrameLayout.LayoutParams ambientLp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(DP_HERO_H));
+        ambientLp.gravity = Gravity.TOP;
+        root.addView(heroAmbientOverlay, ambientLp);
+
         // --- Hero scrim (üst transparan → alt arka plan) ---
         View heroScrim = new View(this);
         heroScrim.setBackground(new GradientDrawable(
             GradientDrawable.Orientation.BOTTOM_TOP,
-            new int[]{ C_BG, 0x99000000, 0x00000000 }));
+            new int[]{ colorBg, withAlpha(colorBg, 0x99), 0x00000000 }));
         FrameLayout.LayoutParams slp = new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, dp(DP_HERO_H));
         slp.gravity = Gravity.TOP;
@@ -196,7 +275,7 @@ public class TvHomeActivity extends Activity {
 
         TextView brand = new TextView(this);
         brand.setText("TV Home");
-        brand.setTextColor(C_TEXT);
+        brand.setTextColor(colorText);
         brand.setTextSize(TypedValue.COMPLEX_SP, 20);
         brand.setLetterSpacing(0.08f);
         brand.setAlpha(0.9f);
@@ -205,32 +284,36 @@ public class TvHomeActivity extends Activity {
 
         clockView = new TextView(this);
         clockView.setText("00:00");
-        clockView.setTextColor(C_TEXT);
+        clockView.setTextColor(colorText);
         clockView.setTextSize(TypedValue.COMPLEX_SP, 16);
         clockView.setGravity(Gravity.CENTER);
         clockView.setPadding(dp(16), dp(8), dp(16), dp(8));
         GradientDrawable badge = new GradientDrawable();
         badge.setCornerRadius(dp(24));
-        badge.setColor(0x33FFFFFF);
-        badge.setStroke(dp(1), 0x22FFFFFF);
+        badge.setColor(withAlpha(colorText, 0x26));
+        badge.setStroke(dp(1), withAlpha(colorText, 0x22));
         clockView.setBackground(badge);
         topBar.addView(clockView);
 
         avatar = new ImageView(this);
         GradientDrawable avBg = new GradientDrawable();
         avBg.setShape(GradientDrawable.OVAL);
-        avBg.setColor(0x26FFFFFF);
-        avBg.setStroke(dp(1), 0x33FFFFFF);
+        avBg.setColor(withAlpha(colorText, 0x26));
+        avBg.setStroke(dp(1), withAlpha(colorText, 0x33));
         avatar.setBackground(avBg);
         avatar.setImageResource(android.R.drawable.ic_menu_preferences);
         avatar.setPadding(dp(10), dp(10), dp(10), dp(10));
-        avatar.setColorFilter(C_TEXT);
+        avatar.setColorFilter(colorText);
         avatar.setFocusable(true);
         avatar.setClickable(true);
         avatar.setOnClickListener(v -> {
             SoundFx.open();
             try { startActivity(new Intent(Settings.ACTION_SETTINGS)); }
             catch (Exception ignored) {}
+        });
+        avatar.setOnLongClickListener(v -> {
+            openLauncherSettings();
+            return true;
         });
         avatar.setOnFocusChangeListener((v, focused) -> {
             SoundFx.focus();
@@ -241,7 +324,6 @@ public class TvHomeActivity extends Activity {
         avatar.setOnKeyListener((v, keyCode, e) -> {
             if (e.getAction() == KeyEvent.ACTION_DOWN
                     && keyCode == KeyEvent.KEYCODE_DPAD_DOWN) {
-                keyDx = 0f; keyDy = 1f; keyTime = SystemClock.uptimeMillis();
                 focusItem(0, rememberedCols.get(0, 0));
                 return true;
             }
@@ -283,11 +365,12 @@ public class TvHomeActivity extends Activity {
         View vig = new View(this);
         vig.setBackground(new GradientDrawable(
             GradientDrawable.Orientation.BOTTOM_TOP,
-            new int[]{ 0xCC0A0A0F, 0x00000000 }));
+            new int[]{ withAlpha(colorBg, 0xCC), 0x00000000 }));
         FrameLayout.LayoutParams vl = new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, dp(140));
         vl.gravity = Gravity.BOTTOM;
         root.addView(vig, vl);
+        updateHeroAmbientMode();
 
         return root;
     }
@@ -328,10 +411,10 @@ public class TvHomeActivity extends Activity {
 
         TextView title = new TextView(this);
         title.setText(s.title);
-        title.setTextColor(C_TEXT);
+        title.setTextColor(colorRowInactive);
         title.setTextSize(TypedValue.COMPLEX_SP, 26);
         title.setLetterSpacing(0.03f);
-        title.setAlpha(0.62f);
+        title.setAlpha(0.72f);
         title.setPadding(dp(DP_PAD_H), 0, dp(DP_PAD_H), dp(10));
         title.setTag("row_title_" + rowIndex);
         row.addView(title);
@@ -384,10 +467,17 @@ public class TvHomeActivity extends Activity {
         // Launcher kendini listelemesin.
         if (pkg.equals(getPackageName())) return;
         if (map.containsKey(pkg)) return;
-        AppInfo info = new AppInfo(pkg, ri.loadLabel(pm).toString(), ri.loadIcon(pm));
+        AppInfo info = new AppInfo(pkg, ri.loadLabel(pm).toString(), deriveSubtitle(pkg), ri.loadIcon(pm));
         // Hero için gerçek TV banner'ı — DeepSeek sürümünde hiç yüklenmiyordu.
         try { info.banner = ri.loadBanner(pm); } catch (Exception ignored) {}
         map.put(pkg, info);
+    }
+
+    private String deriveSubtitle(String pkg) {
+        if (pkg == null) return "";
+        String[] chunks = pkg.split("\\.");
+        if (chunks.length >= 2) return chunks[1].toUpperCase(Locale.ROOT);
+        return chunks.length == 1 ? chunks[0].toUpperCase(Locale.ROOT) : "";
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -461,13 +551,14 @@ public class TvHomeActivity extends Activity {
     private void onItemFocused(int rowIdx, AppInfo info) {
         if (info != currentHeroInfo) {
             currentHeroInfo = info;
-            if (info.banner != null) setHero(info.banner);
+            queueHeroUpdate(info);
         }
         ensureRowVisible(rowIdx);
         for (int j = 0; j < sectionsContainer.getChildCount(); j++) {
             View rowV = sectionsContainer.getChildAt(j);
             View titleV = rowV.findViewWithTag("row_title_" + j);
             if (!(titleV instanceof TextView)) continue;
+            ((TextView) titleV).setTextColor(j == rowIdx ? colorRowActive : colorRowInactive);
             float target = (j == rowIdx) ? 1f : 0.62f;
             if (Math.abs(titleV.getAlpha() - target) > 0.01f) {
                 titleV.animate().alpha(target).setDuration(dur(220)).start();
@@ -475,20 +566,182 @@ public class TvHomeActivity extends Activity {
         }
     }
 
-    private void setHero(Drawable d) {
+    private void queueHeroUpdate(AppInfo info) {
+        if (heroHandler == null || info == null) return;
+        heroUpdateToken++;
+        final int token = heroUpdateToken;
+        if (pendingHeroRunnable != null) heroHandler.removeCallbacks(pendingHeroRunnable);
+        pendingHeroRunnable = () -> {
+            if (token != heroUpdateToken || info != currentHeroInfo) return;
+            Drawable d = getPreparedHero(info);
+            if (d != null) setHero(d, token);
+        };
+        heroHandler.postDelayed(pendingHeroRunnable, dur(HERO_DEBOUNCE_MS));
+    }
+
+    private Drawable getPreparedHero(AppInfo info) {
+        if (info == null) return null;
+        if (wallpaperMode == LauncherUiModels.WALLPAPER_APP_BANNER) {
+            if (info.banner != null) {
+                if (info.preparedBanner == null) {
+                    info.preparedBanner = prepareHeroDrawable(info.banner);
+                }
+                return info.preparedBanner;
+            }
+            return getCuratedHero(info);
+        }
+        return getCuratedHero(info);
+    }
+
+    private Drawable getCuratedHero(AppInfo info) {
+        if (info.curatedBanner == null) {
+            int seed = LauncherUiModels.wallpaperSeedForPackage(info.pkg);
+            int[] colors = LauncherUiModels.curatedGradientForSeed(seed);
+            GradientDrawable g = new GradientDrawable(GradientDrawable.Orientation.TL_BR, colors);
+            g.setGradientType(GradientDrawable.LINEAR_GRADIENT);
+            info.curatedBanner = g;
+        }
+        return info.curatedBanner;
+    }
+
+    private Drawable prepareHeroDrawable(Drawable source) {
+        if (source == null) return null;
+        int width = source.getIntrinsicWidth();
+        int height = source.getIntrinsicHeight();
+        if (width <= 0 || height <= 0) return source;
+        int targetWidth = LauncherPerfProfile.clampHeroDecodeWidth(HERO_MAX_WIDTH_PX, width);
+        if (targetWidth >= width) return source;
+        int targetHeight = Math.max(1, (int) (((long) height * targetWidth) / width));
+        Bitmap.Config config = source.getOpacity() == PixelFormat.OPAQUE
+                ? Bitmap.Config.RGB_565 : Bitmap.Config.ARGB_8888;
+        int oldLeft = source.getBounds().left;
+        int oldTop = source.getBounds().top;
+        int oldRight = source.getBounds().right;
+        int oldBottom = source.getBounds().bottom;
+        try {
+            Bitmap bitmap = Bitmap.createBitmap(targetWidth, targetHeight, config);
+            Canvas canvas = new Canvas(bitmap);
+            source.setBounds(0, 0, targetWidth, targetHeight);
+            source.draw(canvas);
+            return new BitmapDrawable(getResources(), bitmap);
+        } catch (OutOfMemoryError ignored) {
+            return source;
+        } finally {
+            source.setBounds(oldLeft, oldTop, oldRight, oldBottom);
+        }
+    }
+
+    private void setHero(Drawable d, int token) {
         if (d == null) return;
         heroBanner.animate().cancel();
         heroBanner.animate().alpha(0f).scaleX(1.04f).scaleY(1.04f)
-            .setDuration(dur(180)).setInterpolator(new DecelerateInterpolator())
+            .setDuration(dur(HERO_FADE_OUT_MS)).setInterpolator(new DecelerateInterpolator())
             .withEndAction(() -> {
+                if (token != heroUpdateToken) return;
                 heroBanner.setImageDrawable(d);
                 heroBanner.animate().alpha(1f).scaleX(1f).scaleY(1f)
-                    .setDuration(dur(300)).setInterpolator(new DecelerateInterpolator())
+                    .setDuration(dur(HERO_FADE_IN_MS)).setInterpolator(new DecelerateInterpolator())
                     .start();
+                updateHeroAmbientMode();
             }).start();
     }
 
     private int dp(float v) { return (int) (v * density); }
+
+    private void updateHeroAmbientMode() {
+        if (heroAmbientOverlay == null) return;
+        int overlayAlpha = wallpaperMode == LauncherUiModels.WALLPAPER_APP_BANNER ? 0x00 : 0x33;
+        heroAmbientOverlay.setBackground(new GradientDrawable(
+                GradientDrawable.Orientation.BOTTOM_TOP,
+                new int[]{withAlpha(colorBg, overlayAlpha), 0x00000000}));
+        if (ambientAnimator != null) {
+            ambientAnimator.cancel();
+            ambientAnimator = null;
+        }
+        if (wallpaperMode == LauncherUiModels.WALLPAPER_CURATED_AMBIENT && !reducedMotion) {
+            ambientAnimator = ValueAnimator.ofFloat(-14f, 14f);
+            ambientAnimator.setDuration(10_500);
+            ambientAnimator.setRepeatMode(ValueAnimator.REVERSE);
+            ambientAnimator.setRepeatCount(ValueAnimator.INFINITE);
+            ambientAnimator.setInterpolator(new DecelerateInterpolator());
+            ambientAnimator.addUpdateListener(a ->
+                    heroBanner.setTranslationX((float) a.getAnimatedValue()));
+            ambientAnimator.start();
+        } else {
+            heroBanner.setTranslationX(0f);
+        }
+    }
+
+    private static int withAlpha(int color, int alpha) {
+        return (color & 0x00FFFFFF) | ((alpha & 0xFF) << 24);
+    }
+
+    private interface ChoiceHandler {
+        void onChoice(int index);
+    }
+
+    private void openLauncherSettings() {
+        String[] items = {
+                "Theme",
+                "Wallpaper",
+                "Motion",
+                "Sound"
+        };
+        new AlertDialog.Builder(this)
+                .setTitle("Launcher Settings")
+                .setItems(items, (dialog, which) -> {
+                    if (which == 0) {
+                        showChoiceDialog("Theme",
+                                new String[]{"Classic", "Light", "Vibrant"},
+                                themeMode, value -> {
+                                    themeMode = LauncherUiModels.normalizeTheme(value);
+                                    savePref(PREF_THEME_MODE, themeMode);
+                                    recreate();
+                                });
+                    } else if (which == 1) {
+                        showChoiceDialog("Wallpaper",
+                                new String[]{"App banners", "Curated still", "Curated ambient"},
+                                wallpaperMode, value -> {
+                                    wallpaperMode = LauncherUiModels.normalizeWallpaper(value);
+                                    savePref(PREF_WALLPAPER_MODE, wallpaperMode);
+                                    recreate();
+                                });
+                    } else if (which == 2) {
+                        showChoiceDialog("Motion",
+                                new String[]{"System", "Reduced", "Full"},
+                                motionMode, value -> {
+                                    motionMode = LauncherUiModels.normalizeMotion(value);
+                                    savePref(PREF_MOTION_MODE, motionMode);
+                                    recreate();
+                                });
+                    } else {
+                        showChoiceDialog("Sound",
+                                new String[]{"Off", "Soft", "Cinematic"},
+                                soundMode, value -> {
+                                    soundMode = LauncherUiModels.normalizeSound(value);
+                                    savePref(PREF_SOUND_MODE, soundMode);
+                                    applySoundMode();
+                                    if (SoundFx.enabled && clockHandler != null) {
+                                        SoundFx.ready = false;
+                                        clockHandler.postDelayed(() -> SoundFx.ready = true, 350);
+                                    }
+                                });
+                    }
+                })
+                .setNegativeButton("Close", null)
+                .show();
+    }
+
+    private void showChoiceDialog(String title, String[] labels, int checkedItem, ChoiceHandler handler) {
+        new AlertDialog.Builder(this)
+                .setTitle(title)
+                .setSingleChoiceItems(labels, checkedItem, (dialog, which) -> {
+                    handler.onChoice(which);
+                    dialog.dismiss();
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
 
     // ═══════════════════════════════════════════════════════════════
     //  VERİ SINIFLARI
@@ -496,9 +749,17 @@ public class TvHomeActivity extends Activity {
     static class AppInfo {
         final String pkg;
         final String label;
+        final String subtitle;
         final Drawable icon;
         Drawable banner;
-        AppInfo(String p, String l, Drawable i) { pkg = p; label = l; icon = i; }
+        Drawable preparedBanner;
+        Drawable curatedBanner;
+        AppInfo(String p, String l, String s, Drawable i) {
+            pkg = p;
+            label = l;
+            subtitle = s;
+            icon = i;
+        }
     }
 
     static class Section {
@@ -516,6 +777,7 @@ public class TvHomeActivity extends Activity {
     class AppCard extends LinearLayout {
         private final FrameLayout tile;
         private final TextView label;
+        private final TextView subtitle;
         private final AppInfo info;
         private final int rowIdx, colIdx, rowSize;
         private boolean focused;
@@ -538,7 +800,7 @@ public class TvHomeActivity extends Activity {
             tile = new FrameLayout(TvHomeActivity.this);
             GradientDrawable bg = new GradientDrawable();
             bg.setCornerRadius(dp(14));
-            bg.setColor(C_CARD);
+            bg.setColor(colorCard);
             tile.setBackground(bg);
             tile.setOutlineProvider(new ViewOutlineProvider() {
                 @Override public void getOutline(View v, Outline o) {
@@ -546,7 +808,7 @@ public class TvHomeActivity extends Activity {
                 }
             });
             tile.setClipToOutline(false);
-            tile.setElevation(dp(2));
+            tile.setElevation(dp(1));
             tile.setCameraDistance(6000f * density);
 
             ImageView icon = new ImageView(TvHomeActivity.this);
@@ -562,14 +824,25 @@ public class TvHomeActivity extends Activity {
             // --- label (karonun altında) ---
             label = new TextView(TvHomeActivity.this);
             label.setText(info.label);
-            label.setTextColor(C_TEXT);
+            label.setTextColor(colorText);
             label.setTextSize(TypedValue.COMPLEX_SP, 14);
             label.setGravity(Gravity.CENTER_HORIZONTAL);
             label.setMaxLines(1);
             label.setEllipsize(TextUtils.TruncateAt.END);
             label.setAlpha(0f);
-            label.setPadding(dp(4), dp(6), dp(4), 0);
-            addView(label, new LinearLayout.LayoutParams(dp(DP_TILE_W), dp(DP_LABEL_H)));
+            label.setPadding(dp(4), dp(4), dp(4), 0);
+            addView(label, new LinearLayout.LayoutParams(dp(DP_TILE_W), dp(30)));
+
+            subtitle = new TextView(TvHomeActivity.this);
+            subtitle.setText(info.subtitle);
+            subtitle.setTextColor(colorMutedText);
+            subtitle.setTextSize(TypedValue.COMPLEX_SP, 11);
+            subtitle.setGravity(Gravity.CENTER_HORIZONTAL);
+            subtitle.setMaxLines(1);
+            subtitle.setEllipsize(TextUtils.TruncateAt.END);
+            subtitle.setAlpha(0.72f);
+            subtitle.setPadding(dp(4), 0, dp(4), 0);
+            addView(subtitle, new LinearLayout.LayoutParams(dp(DP_TILE_W), dp(24)));
 
             setOnClickListener(v -> {
                 SoundFx.open();
@@ -578,7 +851,7 @@ public class TvHomeActivity extends Activity {
 
             setOnLongClickListener(v -> {
                 // Tuş bırakma olayı ayarlar ekranına gidecek; basma ölçeğini geri al.
-                if (focused) animateScale(FOCUS_SCALE, dur(200), true);
+                if (focused) animateScale(FOCUS_SCALE, dur(FOCUS_ANIM_MS));
                 try {
                     Intent i = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
                         Uri.parse("package:" + info.pkg));
@@ -596,9 +869,9 @@ public class TvHomeActivity extends Activity {
                 if (isCenter) {
                     if (e.getAction() == KeyEvent.ACTION_DOWN && e.getRepeatCount() == 0) {
                         SoundFx.press();
-                        animateScale(FOCUS_SCALE * PRESS_SCALE, dur(90), false);
+                        animateScale(FOCUS_SCALE * PRESS_SCALE, dur(90));
                     } else if (e.getAction() == KeyEvent.ACTION_UP) {
-                        animateScale(FOCUS_SCALE, dur(160), true);
+                        animateScale(FOCUS_SCALE, dur(FOCUS_ANIM_MS));
                     }
                     return false; // click release'de ateşlensin
                 }
@@ -606,9 +879,6 @@ public class TvHomeActivity extends Activity {
                 if (e.getAction() != KeyEvent.ACTION_DOWN) return false;
 
                 if (keyCode == KeyEvent.KEYCODE_DPAD_UP || keyCode == KeyEvent.KEYCODE_DPAD_DOWN) {
-                    keyDx = 0f;
-                    keyDy = keyCode == KeyEvent.KEYCODE_DPAD_UP ? -1f : 1f;
-                    keyTime = SystemClock.uptimeMillis();
                     rememberedCols.put(rowIdx, colIdx); // satır hafızası artık yazılıyor
                     jumpRows(rowIdx, colIdx, keyCode);
                     return true;
@@ -621,56 +891,38 @@ public class TvHomeActivity extends Activity {
                     SoundFx.back();
                     return true;
                 }
-                if (keyCode == KeyEvent.KEYCODE_DPAD_LEFT || keyCode == KeyEvent.KEYCODE_DPAD_RIGHT) {
-                    keyDx = keyCode == KeyEvent.KEYCODE_DPAD_LEFT ? -1f : 1f;
-                    keyDy = 0f;
-                    keyTime = SystemClock.uptimeMillis();
-                }
                 return false;
             });
 
             setOnFocusChangeListener((v, hasFocus) -> {
                 this.focused = hasFocus;
                 if (hasFocus) {
-                    animateScale(FOCUS_SCALE, dur(260), true);
+                    animateScale(FOCUS_SCALE, dur(FOCUS_ANIM_MS));
                     // Gölge derinliği: translationZ (elevation() metodu yoktur!)
-                    tile.animate().translationZ(dp(14)).setDuration(dur(220)).start();
+                    tile.animate().translationZ(dp(6)).setDuration(dur(FOCUS_ANIM_MS)).start();
                     // Z-order: odaktaki karo komşuların ÜSTÜNDE çizilsin.
-                    animate().translationZ(dp(8)).setDuration(dur(220)).start();
+                    animate().translationZ(dp(3)).setDuration(dur(FOCUS_ANIM_MS)).start();
                     label.animate().alpha(1f).setDuration(dur(120)).start();
+                    subtitle.animate().alpha(1f).setDuration(dur(120)).start();
                     SoundFx.focus();
                     rememberedCols.put(rowIdx, colIdx);
                     onItemFocused(rowIdx, info);
                     revealCard(this);
-
-                    boolean fresh = SystemClock.uptimeMillis() - keyTime < TILT_WINDOW_MS;
-                    if (fresh && !reducedMotion) {
-                        // Hareket yönüne eğil, sonra yaylanarak otur.
-                        tile.setRotationY(keyDx * TILT_DEG);
-                        tile.setRotationX(-keyDy * TILT_DEG);
-                        keyDx = keyDy = 0f; // eski yön bir dahaki odağa sızmasın
-                    }
-                    tile.animate().rotationX(0f).rotationY(0f)
-                        .setDuration(dur(280)).setInterpolator(new DecelerateInterpolator())
-                        .start();
                 } else {
-                    animateScale(1f, dur(200), false);
-                    tile.animate().translationZ(0f).setDuration(dur(220)).start();
-                    animate().translationZ(0f).setDuration(dur(220)).start();
-                    label.animate().alpha(0f).setDuration(dur(100)).start();
-                    tile.animate().rotationX(0f).rotationY(0f)
-                        .setDuration(dur(220)).setInterpolator(new DecelerateInterpolator())
-                        .start();
+                    animateScale(1f, dur(UNFOCUS_ANIM_MS));
+                    tile.animate().translationZ(0f).setDuration(dur(UNFOCUS_ANIM_MS)).start();
+                    animate().translationZ(0f).setDuration(dur(UNFOCUS_ANIM_MS)).start();
+                    label.animate().alpha(0f).setDuration(dur(90)).start();
+                    subtitle.animate().alpha(0.72f).setDuration(dur(90)).start();
                 }
             });
         }
 
-        private void animateScale(float target, long durMs, boolean overshoot) {
+        private void animateScale(float target, long durMs) {
             if (scaleAnim != null) scaleAnim.cancel();
             scaleAnim = ValueAnimator.ofFloat(currentScale, target);
             scaleAnim.setDuration(durMs);
-            scaleAnim.setInterpolator(overshoot
-                ? new OvershootInterpolator(1.6f) : new DecelerateInterpolator());
+            scaleAnim.setInterpolator(new DecelerateInterpolator());
             scaleAnim.addUpdateListener(a -> {
                 currentScale = (float) a.getAnimatedValue();
                 tile.setScaleX(currentScale);
@@ -701,17 +953,37 @@ public class TvHomeActivity extends Activity {
         private static final int SR = 44100;
         private static AudioTrack focus, press, back, open;
         static volatile boolean ready = false; // açılış tikini bastır
+        static volatile boolean enabled = true;
+        private static int profile = LauncherUiModels.SOUND_OFF;
+
+        static void setEnabled(boolean value) {
+            enabled = value;
+            if (!enabled) ready = false;
+        }
+
+        static void setProfile(int mode) {
+            profile = LauncherUiModels.normalizeSound(mode);
+            release();
+        }
 
         static void init() {
+            if (!enabled) return;
             if (focus != null) return;
-            // Yumuşak "tik" — ana ton + zayıf üst kısmi, çok hızlı sönüm.
-            focus = tone(new double[][]{{1568, 1.0}, {2350, 0.30}}, 45, 0.28f, 0.007);
-            // Basma "tok" — gövdeli alt oktav ile.
-            press = tone(new double[][]{{784, 1.0}, {392, 0.45}}, 80, 0.42f, 0.018);
-            // Geri — alçalan süpürme.
-            back  = sweep(700, 320, 130, 0.40f);
-            // Açılış — yükselen iki tonlu yumuşak zil.
-            open  = chime(new double[]{659, 988}, 260, 0.42f);
+            if (profile == LauncherUiModels.SOUND_CINEMATIC) {
+                focus = tone(new double[][]{{1320, 1.0}, {1980, 0.34}}, 48, 0.34f, 0.010);
+                press = tone(new double[][]{{740, 1.0}, {370, 0.52}}, 88, 0.50f, 0.020);
+                back  = sweep(720, 280, 140, 0.44f);
+                open  = chime(new double[]{659, 988}, 270, 0.46f);
+            } else {
+                // Yumuşak "tik" — ana ton + zayıf üst kısmi, çok hızlı sönüm.
+                focus = tone(new double[][]{{1568, 1.0}, {2350, 0.30}}, 45, 0.28f, 0.007);
+                // Basma "tok" — gövdeli alt oktav ile.
+                press = tone(new double[][]{{784, 1.0}, {392, 0.45}}, 80, 0.42f, 0.018);
+                // Geri — alçalan süpürme.
+                back  = sweep(700, 320, 130, 0.40f);
+                // Açılış — yükselen iki tonlu yumuşak zil.
+                open  = chime(new double[]{659, 988}, 260, 0.42f);
+            }
         }
 
         /** Çok kısmi tonlu vuruş: partials = {frekans, genlik} çiftleri. */
@@ -790,7 +1062,7 @@ public class TvHomeActivity extends Activity {
         static void open()  { play(open); }
 
         private static void play(AudioTrack t) {
-            if (t == null || !ready) return;
+            if (!enabled || t == null || !ready) return;
             try {
                 t.stop();
                 t.reloadStaticData();
