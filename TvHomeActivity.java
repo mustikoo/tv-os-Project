@@ -6,7 +6,11 @@ import android.app.ActivityOptions;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
 import android.graphics.Outline;
+import android.graphics.PixelFormat;
+import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.media.AudioAttributes;
@@ -16,7 +20,6 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
-import android.os.SystemClock;
 import android.provider.Settings;
 import android.text.TextUtils;
 import android.util.SparseIntArray;
@@ -28,7 +31,6 @@ import android.view.ViewGroup;
 import android.view.ViewOutlineProvider;
 import android.view.ViewParent;
 import android.view.animation.DecelerateInterpolator;
-import android.view.animation.OvershootInterpolator;
 import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
@@ -72,10 +74,16 @@ public class TvHomeActivity extends Activity {
     private static final int    C_CARD         = 0xFF1C1C24;
     private static final int    C_TEXT         = 0xFFF5F5F7;
 
-    private static final float  FOCUS_SCALE    = 1.10f;
-    private static final float  PRESS_SCALE    = 0.95f;
-    private static final float  TILT_DEG       = 5f;
-    private static final long   TILT_WINDOW_MS = 150;
+    // Apollo Premium4K için: 4K/60 çıkış korunurken launcher yüzeyi 1080p'de 60 FPS hedefler.
+    private static final float  FOCUS_SCALE    = LauncherPerfProfile.FOCUS_SCALE;
+    private static final float  PRESS_SCALE    = 0.96f;
+    private static final long   FOCUS_ANIM_MS  = LauncherPerfProfile.FOCUS_ANIM_MS;
+    private static final long   UNFOCUS_ANIM_MS = LauncherPerfProfile.UNFOCUS_ANIM_MS;
+    private static final long   HERO_DEBOUNCE_MS = LauncherPerfProfile.HERO_DEBOUNCE_MS;
+    private static final long   HERO_FADE_OUT_MS = LauncherPerfProfile.HERO_FADE_OUT_MS;
+    private static final long   HERO_FADE_IN_MS = LauncherPerfProfile.HERO_FADE_IN_MS;
+    private static final int    HERO_MAX_WIDTH_PX = LauncherPerfProfile.HERO_MAX_DECODE_WIDTH;
+    private static final boolean NAV_SOUNDS_ENABLED_DEFAULT = false;
 
     private static final int    DP_HERO_H      = 480;
     private static final int    DP_TILE_W      = 200;
@@ -100,9 +108,9 @@ public class TvHomeActivity extends Activity {
     private boolean reducedMotion = false;
     private AppInfo currentHeroInfo;
     private Handler clockHandler;
-
-    private static float keyDx, keyDy;
-    private static long  keyTime;
+    private Handler heroHandler;
+    private Runnable pendingHeroRunnable;
+    private int heroUpdateToken = 0;
 
     // ═══════════════════════════════════════════════════════════════
     //  YAŞAM DÖNGÜSÜ
@@ -112,10 +120,14 @@ public class TvHomeActivity extends Activity {
         density = getResources().getDisplayMetrics().density;
         reducedMotion = Settings.Global.getFloat(getContentResolver(),
                 Settings.Global.ANIMATOR_DURATION_SCALE, 1f) == 0f;
+        SoundFx.setEnabled(NAV_SOUNDS_ENABLED_DEFAULT);
         SoundFx.init();
         // Açılıştaki ilk otomatik odakta "tik" çalmasın.
         clockHandler = new Handler(Looper.getMainLooper());
-        clockHandler.postDelayed(() -> SoundFx.ready = true, 500);
+        heroHandler = new Handler(Looper.getMainLooper());
+        if (NAV_SOUNDS_ENABLED_DEFAULT) {
+            clockHandler.postDelayed(() -> SoundFx.ready = true, 500);
+        }
 
         setContentView(buildLayout());
         renderSections();
@@ -127,6 +139,7 @@ public class TvHomeActivity extends Activity {
     @Override protected void onDestroy() {
         super.onDestroy();
         if (clockHandler != null) clockHandler.removeCallbacksAndMessages(null);
+        if (heroHandler != null) heroHandler.removeCallbacksAndMessages(null);
         SoundFx.release();
     }
 
@@ -241,7 +254,6 @@ public class TvHomeActivity extends Activity {
         avatar.setOnKeyListener((v, keyCode, e) -> {
             if (e.getAction() == KeyEvent.ACTION_DOWN
                     && keyCode == KeyEvent.KEYCODE_DPAD_DOWN) {
-                keyDx = 0f; keyDy = 1f; keyTime = SystemClock.uptimeMillis();
                 focusItem(0, rememberedCols.get(0, 0));
                 return true;
             }
@@ -461,7 +473,7 @@ public class TvHomeActivity extends Activity {
     private void onItemFocused(int rowIdx, AppInfo info) {
         if (info != currentHeroInfo) {
             currentHeroInfo = info;
-            if (info.banner != null) setHero(info.banner);
+            queueHeroUpdate(info);
         }
         ensureRowVisible(rowIdx);
         for (int j = 0; j < sectionsContainer.getChildCount(); j++) {
@@ -475,15 +487,64 @@ public class TvHomeActivity extends Activity {
         }
     }
 
-    private void setHero(Drawable d) {
+    private void queueHeroUpdate(AppInfo info) {
+        if (heroHandler == null || info == null) return;
+        heroUpdateToken++;
+        final int token = heroUpdateToken;
+        if (pendingHeroRunnable != null) heroHandler.removeCallbacks(pendingHeroRunnable);
+        pendingHeroRunnable = () -> {
+            if (token != heroUpdateToken || info != currentHeroInfo) return;
+            Drawable d = getPreparedHero(info);
+            if (d != null) setHero(d, token);
+        };
+        heroHandler.postDelayed(pendingHeroRunnable, dur(HERO_DEBOUNCE_MS));
+    }
+
+    private Drawable getPreparedHero(AppInfo info) {
+        if (info == null || info.banner == null) return null;
+        if (info.preparedBanner == null) {
+            info.preparedBanner = prepareHeroDrawable(info.banner);
+        }
+        return info.preparedBanner;
+    }
+
+    private Drawable prepareHeroDrawable(Drawable source) {
+        if (source == null) return null;
+        int width = source.getIntrinsicWidth();
+        int height = source.getIntrinsicHeight();
+        if (width <= 0 || height <= 0) return source;
+        int targetWidth = LauncherPerfProfile.clampHeroDecodeWidth(HERO_MAX_WIDTH_PX, width);
+        if (targetWidth >= width) return source;
+        int targetHeight = Math.max(1, (int) (((long) height * targetWidth) / width));
+        Bitmap.Config config = source.getOpacity() == PixelFormat.OPAQUE
+                ? Bitmap.Config.RGB_565 : Bitmap.Config.ARGB_8888;
+        int oldLeft = source.getBounds().left;
+        int oldTop = source.getBounds().top;
+        int oldRight = source.getBounds().right;
+        int oldBottom = source.getBounds().bottom;
+        try {
+            Bitmap bitmap = Bitmap.createBitmap(targetWidth, targetHeight, config);
+            Canvas canvas = new Canvas(bitmap);
+            source.setBounds(0, 0, targetWidth, targetHeight);
+            source.draw(canvas);
+            return new BitmapDrawable(getResources(), bitmap);
+        } catch (OutOfMemoryError ignored) {
+            return source;
+        } finally {
+            source.setBounds(oldLeft, oldTop, oldRight, oldBottom);
+        }
+    }
+
+    private void setHero(Drawable d, int token) {
         if (d == null) return;
         heroBanner.animate().cancel();
         heroBanner.animate().alpha(0f).scaleX(1.04f).scaleY(1.04f)
-            .setDuration(dur(180)).setInterpolator(new DecelerateInterpolator())
+            .setDuration(dur(HERO_FADE_OUT_MS)).setInterpolator(new DecelerateInterpolator())
             .withEndAction(() -> {
+                if (token != heroUpdateToken) return;
                 heroBanner.setImageDrawable(d);
                 heroBanner.animate().alpha(1f).scaleX(1f).scaleY(1f)
-                    .setDuration(dur(300)).setInterpolator(new DecelerateInterpolator())
+                    .setDuration(dur(HERO_FADE_IN_MS)).setInterpolator(new DecelerateInterpolator())
                     .start();
             }).start();
     }
@@ -498,6 +559,7 @@ public class TvHomeActivity extends Activity {
         final String label;
         final Drawable icon;
         Drawable banner;
+        Drawable preparedBanner;
         AppInfo(String p, String l, Drawable i) { pkg = p; label = l; icon = i; }
     }
 
@@ -546,7 +608,7 @@ public class TvHomeActivity extends Activity {
                 }
             });
             tile.setClipToOutline(false);
-            tile.setElevation(dp(2));
+            tile.setElevation(dp(1));
             tile.setCameraDistance(6000f * density);
 
             ImageView icon = new ImageView(TvHomeActivity.this);
@@ -578,7 +640,7 @@ public class TvHomeActivity extends Activity {
 
             setOnLongClickListener(v -> {
                 // Tuş bırakma olayı ayarlar ekranına gidecek; basma ölçeğini geri al.
-                if (focused) animateScale(FOCUS_SCALE, dur(200), true);
+                if (focused) animateScale(FOCUS_SCALE, dur(FOCUS_ANIM_MS));
                 try {
                     Intent i = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
                         Uri.parse("package:" + info.pkg));
@@ -596,9 +658,9 @@ public class TvHomeActivity extends Activity {
                 if (isCenter) {
                     if (e.getAction() == KeyEvent.ACTION_DOWN && e.getRepeatCount() == 0) {
                         SoundFx.press();
-                        animateScale(FOCUS_SCALE * PRESS_SCALE, dur(90), false);
+                        animateScale(FOCUS_SCALE * PRESS_SCALE, dur(90));
                     } else if (e.getAction() == KeyEvent.ACTION_UP) {
-                        animateScale(FOCUS_SCALE, dur(160), true);
+                        animateScale(FOCUS_SCALE, dur(FOCUS_ANIM_MS));
                     }
                     return false; // click release'de ateşlensin
                 }
@@ -606,9 +668,6 @@ public class TvHomeActivity extends Activity {
                 if (e.getAction() != KeyEvent.ACTION_DOWN) return false;
 
                 if (keyCode == KeyEvent.KEYCODE_DPAD_UP || keyCode == KeyEvent.KEYCODE_DPAD_DOWN) {
-                    keyDx = 0f;
-                    keyDy = keyCode == KeyEvent.KEYCODE_DPAD_UP ? -1f : 1f;
-                    keyTime = SystemClock.uptimeMillis();
                     rememberedCols.put(rowIdx, colIdx); // satır hafızası artık yazılıyor
                     jumpRows(rowIdx, colIdx, keyCode);
                     return true;
@@ -621,56 +680,36 @@ public class TvHomeActivity extends Activity {
                     SoundFx.back();
                     return true;
                 }
-                if (keyCode == KeyEvent.KEYCODE_DPAD_LEFT || keyCode == KeyEvent.KEYCODE_DPAD_RIGHT) {
-                    keyDx = keyCode == KeyEvent.KEYCODE_DPAD_LEFT ? -1f : 1f;
-                    keyDy = 0f;
-                    keyTime = SystemClock.uptimeMillis();
-                }
                 return false;
             });
 
             setOnFocusChangeListener((v, hasFocus) -> {
                 this.focused = hasFocus;
                 if (hasFocus) {
-                    animateScale(FOCUS_SCALE, dur(260), true);
+                    animateScale(FOCUS_SCALE, dur(FOCUS_ANIM_MS));
                     // Gölge derinliği: translationZ (elevation() metodu yoktur!)
-                    tile.animate().translationZ(dp(14)).setDuration(dur(220)).start();
+                    tile.animate().translationZ(dp(6)).setDuration(dur(FOCUS_ANIM_MS)).start();
                     // Z-order: odaktaki karo komşuların ÜSTÜNDE çizilsin.
-                    animate().translationZ(dp(8)).setDuration(dur(220)).start();
+                    animate().translationZ(dp(3)).setDuration(dur(FOCUS_ANIM_MS)).start();
                     label.animate().alpha(1f).setDuration(dur(120)).start();
                     SoundFx.focus();
                     rememberedCols.put(rowIdx, colIdx);
                     onItemFocused(rowIdx, info);
                     revealCard(this);
-
-                    boolean fresh = SystemClock.uptimeMillis() - keyTime < TILT_WINDOW_MS;
-                    if (fresh && !reducedMotion) {
-                        // Hareket yönüne eğil, sonra yaylanarak otur.
-                        tile.setRotationY(keyDx * TILT_DEG);
-                        tile.setRotationX(-keyDy * TILT_DEG);
-                        keyDx = keyDy = 0f; // eski yön bir dahaki odağa sızmasın
-                    }
-                    tile.animate().rotationX(0f).rotationY(0f)
-                        .setDuration(dur(280)).setInterpolator(new DecelerateInterpolator())
-                        .start();
                 } else {
-                    animateScale(1f, dur(200), false);
-                    tile.animate().translationZ(0f).setDuration(dur(220)).start();
-                    animate().translationZ(0f).setDuration(dur(220)).start();
-                    label.animate().alpha(0f).setDuration(dur(100)).start();
-                    tile.animate().rotationX(0f).rotationY(0f)
-                        .setDuration(dur(220)).setInterpolator(new DecelerateInterpolator())
-                        .start();
+                    animateScale(1f, dur(UNFOCUS_ANIM_MS));
+                    tile.animate().translationZ(0f).setDuration(dur(UNFOCUS_ANIM_MS)).start();
+                    animate().translationZ(0f).setDuration(dur(UNFOCUS_ANIM_MS)).start();
+                    label.animate().alpha(0f).setDuration(dur(90)).start();
                 }
             });
         }
 
-        private void animateScale(float target, long durMs, boolean overshoot) {
+        private void animateScale(float target, long durMs) {
             if (scaleAnim != null) scaleAnim.cancel();
             scaleAnim = ValueAnimator.ofFloat(currentScale, target);
             scaleAnim.setDuration(durMs);
-            scaleAnim.setInterpolator(overshoot
-                ? new OvershootInterpolator(1.6f) : new DecelerateInterpolator());
+            scaleAnim.setInterpolator(new DecelerateInterpolator());
             scaleAnim.addUpdateListener(a -> {
                 currentScale = (float) a.getAnimatedValue();
                 tile.setScaleX(currentScale);
@@ -701,8 +740,15 @@ public class TvHomeActivity extends Activity {
         private static final int SR = 44100;
         private static AudioTrack focus, press, back, open;
         static volatile boolean ready = false; // açılış tikini bastır
+        static volatile boolean enabled = true;
+
+        static void setEnabled(boolean value) {
+            enabled = value;
+            if (!enabled) ready = false;
+        }
 
         static void init() {
+            if (!enabled) return;
             if (focus != null) return;
             // Yumuşak "tik" — ana ton + zayıf üst kısmi, çok hızlı sönüm.
             focus = tone(new double[][]{{1568, 1.0}, {2350, 0.30}}, 45, 0.28f, 0.007);
@@ -790,7 +836,7 @@ public class TvHomeActivity extends Activity {
         static void open()  { play(open); }
 
         private static void play(AudioTrack t) {
-            if (t == null || !ready) return;
+            if (!enabled || t == null || !ready) return;
             try {
                 t.stop();
                 t.reloadStaticData();
